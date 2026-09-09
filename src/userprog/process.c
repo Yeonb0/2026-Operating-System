@@ -18,8 +18,24 @@
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 
+/* [1-1-2] Argument Passing : 명령행 처리 한계값
+   목적 : 명령행 사본 버퍼와 argv 배열의 크기를 한곳에서 관리한다
+   참고 : Pintos manual 3.3.3 - pintos 유틸리티가 커널에 전달할 수 있는
+          명령행 인자는 128바이트로 제한된다, proj1 슬라이드 35
+   주의 : 128바이트를 한 글자 인자로 모두 채워도 토큰 수는 64개를 넘지 않는다 */
+#define MAX_CMD_LEN 128
+#define MAX_ARGC 64
+
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
+
+/* [1-1-2] Argument Passing : 사용자 스택 구성 함수 선언
+   참고 : Pintos manual 3.5 (80x86 Calling Convention), proj1 슬라이드 35 */
+static void construct_stack (const char *cmdline, void **esp);
+
+/* [1-1-7] exec, wait : 자식 프로세스 검색 함수 선언
+   참고 : proj1 슬라이드 44 - 자식 스레드 ID 가 유효한지 확인한다 */
+static struct thread *get_child_process (tid_t tid);
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -31,6 +47,20 @@ process_execute (const char *file_name)
   char *fn_copy;
   tid_t tid;
 
+  /* [1-1-2] Argument Passing : 프로그램 이름 분리용 버퍼
+     목적 : 명령행 전체가 아닌 첫 토큰만 thread_create() 에 넘겨
+            스레드 이름이 실행 파일 이름과 일치하도록 한다
+     입력 : file_name - "args-single onearg" 형태의 원본 명령행
+     출력 : Prog_name 에 첫 토큰만 남는다
+     참고 : proj1 슬라이드 48 - 49, Pintos manual 3.3.3
+     주의 : strtok_r() 은 대상 문자열을 직접 변형하므로 const 인 file_name 이나
+            load() 로 전달되는 fn_copy 를 그대로 넘기면 안 된다 */
+  char Prog_name[MAX_CMD_LEN];
+  char *save_ptr;
+
+  /* [1-1-7] 자식의 적재 결과를 확인하기 위한 포인터 */
+  struct thread *Child;
+
   /* Make a copy of FILE_NAME.
      Otherwise there's a race between the caller and load(). */
   fn_copy = palloc_get_page (0);
@@ -38,11 +68,70 @@ process_execute (const char *file_name)
     return TID_ERROR;
   strlcpy (fn_copy, file_name, PGSIZE);
 
+  /* [1-1-2] 명령행에서 첫 토큰만 추출
+     참고 : strtok_r() 은 lib/string.c 에 정의되어 있다 (proj1 슬라이드 48)
+     주의 : 연속 공백은 strtok_r() 이 자동으로 건너뛰므로
+            args-dbl-space 가 요구하는 argc = 3 동작이 그대로 만족된다 */
+  strlcpy (Prog_name, file_name, sizeof Prog_name);
+  strtok_r (Prog_name, " ", &save_ptr);
+
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+
+  /* [1-1-2] 수정 : thread_create() 에 넘기는 이름을 file_name 에서 Prog_name 으로 교체
+     변경 내용 : 명령행 전체 대신 첫 토큰만 스레드 이름으로 등록
+     변경 이유 : 스레드 이름이 1-1-5 의 Process Termination Message 에 쓰이며,
+                args-single.ck 은 "args-single: exit(0)" 을 기대한다
+     영향 범위 : fn_copy 는 그대로 유지되므로 인자 정보는 load() 까지 보존된다 */
+  tid = thread_create (Prog_name, PRI_DEFAULT, start_process, fn_copy);
   if (tid == TID_ERROR)
-    palloc_free_page (fn_copy); 
+    {
+      palloc_free_page (fn_copy);
+      return tid;
+    }
+
+  /* [1-1-7] 수정 : 자식의 실행 파일 적재 결과를 기다린 뒤 반환
+     변경 내용 : thread_create() 성공 후 자식이 Load_sema 를 올릴 때까지 대기하고,
+                적재에 실패했으면 TID_ERROR 를 반환한다
+     변경 이유 : exec 은 프로그램을 적재할 수 없으면 -1 을 반환해야 한다
+                기다리지 않으면 부모가 성공 여부를 알기 전에 tid 를 돌려주게 된다
+     영향 범위 : 적재에 성공하는 정상 경로에서는 자식이 곧바로 세마포어를 올리므로
+                지연이 사실상 없다
+     참고 : Pintos manual 3.3.4 exec, proj1 슬라이드 44 */
+  Child = get_child_process (tid);
+  if (Child == NULL)
+    return TID_ERROR;
+
+  sema_down (&Child->Load_sema);
+  if (!Child->is_loaded)
+    return TID_ERROR;
+
   return tid;
+}
+
+/* [1-1-7] exec, wait : tid 로 자식 프로세스 찾기
+   목적 : 현재 스레드의 Child_list 를 훑어 해당 tid 를 가진 자식을 반환한다
+   입력 : tid - 찾을 자식의 스레드 식별자
+   출력 : 찾으면 struct thread *, 없으면 NULL
+   참고 : proj1 슬라이드 44, lib/kernel/list.h 의 list_entry 매크로
+   주의 : 자기 자식이 아닌 tid 를 넘기면 NULL 이 반환되어야 한다
+          wait-bad-pid 는 존재하지 않는 pid 로 wait 을 호출하고 -1 을 기대한다
+          이미 회수된 자식은 process_wait() 에서 목록에서 제거되므로
+          두 번째 wait 호출도 자연히 NULL 을 받는다 (wait-twice) */
+static struct thread *
+get_child_process (tid_t tid)
+{
+  struct thread *cur = thread_current ();
+  struct list_elem *e;
+
+  for (e = list_begin (&cur->Child_list); e != list_end (&cur->Child_list);
+       e = list_next (e))
+    {
+      struct thread *t = list_entry (e, struct thread, Child_elem);
+      if (t->tid == tid)
+        return t;
+    }
+
+  return NULL;
 }
 
 /* A thread function that loads a user process and starts it
@@ -54,12 +143,31 @@ start_process (void *file_name_)
   struct intr_frame if_;
   bool success;
 
+  /* [1-1-5] Process Termination Message : 종료 상태 초기값 설정
+     목적 : 이 프로세스가 exit() 을 거치지 않고 강제 종료되는 경우에도
+            종료 코드 -1 이 남도록 미리 설정한다
+     참고 : Pintos manual 3.3.2, bad-read.ck / bad-write.ck 의 기대 출력
+     주의 : page fault 는 exception.c 의 kill() 을 거쳐 thread_exit() 으로
+            이어지므로 exit() 을 호출하지 않는다. 그 경로에서도 -1 이 나오도록
+            exception.c 를 고치는 대신 초기값으로 해결한다 */
+  thread_current ()->exit_status = -1;
+
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
   success = load (file_name, &if_.eip, &if_.esp);
+
+  /* [1-1-7] 수정 : 적재 결과를 부모에게 알린다
+     변경 내용 : load() 결과를 is_loaded 에 기록하고 Load_sema 를 올린다
+     변경 이유 : process_execute() 에서 대기 중인 부모가 exec 의 반환값을
+                결정하려면 적재 성공 여부를 알아야 한다
+     영향 범위 : 적재 실패 시에도 반드시 세마포어를 올려야 한다
+                올리지 않으면 부모가 영원히 깨어나지 못한다
+     주의 : thread_exit() 보다 먼저 수행해야 한다 */
+  thread_current ()->is_loaded = success;
+  sema_up (&thread_current ()->Load_sema);
 
   /* If load failed, quit. */
   palloc_free_page (file_name);
@@ -86,9 +194,38 @@ start_process (void *file_name_)
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
 int
-process_wait (tid_t child_tid UNUSED) 
+process_wait (tid_t child_tid) 
 {
-  return -1;
+  /* [1-1-7] 수정 : 임시 대기 루프를 제거하고 정식 wait 구현으로 교체
+     변경 내용 : 자식을 tid 로 찾아 종료를 기다린 뒤 종료 상태를 반환하고,
+                목록에서 제거한 다음 자식의 자원 회수를 허용한다
+     변경 이유 : 1-1-2 에서 넣은 for (;;) thread_yield () 는 자식이 실행될
+                시간을 벌기 위한 임시 조치였다
+     영향 범위 : 이제 run_task() 가 정상적으로 반환되어 Pintos 가 스스로 종료된다
+                Ctrl + C 로 강제 종료할 필요가 없어진다
+     참고 : Pintos manual 3.3.4 wait, proj1 슬라이드 44
+     주의 : 자식이 아니거나 이미 회수한 tid 이면 -1 을 반환한다
+            Destroy_sema 를 올리기 전에 exit_status 를 먼저 읽어야 한다
+            자식이 깨어나면 struct thread 가 해제될 수 있기 때문이다 */
+  struct thread *Child;
+  int status;
+
+  Child = get_child_process (child_tid);
+  if (Child == NULL)
+    return -1;
+
+  /* 자식이 종료할 때까지 기다린다 */
+  sema_down (&Child->Exit_sema);
+
+  status = Child->exit_status;
+
+  /* 회수한 자식은 목록에서 제거해 두 번째 wait 이 -1 을 받도록 한다 */
+  list_remove (&Child->Child_elem);
+
+  /* 자식이 남은 정리를 마치고 소멸할 수 있도록 풀어 준다 */
+  sema_up (&Child->Destroy_sema);
+
+  return status;
 }
 
 /* Free the current process's resources. */
@@ -98,11 +235,39 @@ process_exit (void)
   struct thread *cur = thread_current ();
   uint32_t *pd;
 
+  /* [1-1-7] 사용자 프로세스 여부를 미리 기록해 둔다
+     pagedir 은 아래에서 NULL 로 바뀌므로 판정에 쓸 수 없다 */
+  bool is_user_process = (cur->pagedir != NULL);
+  struct list_elem *e;
+
+  /* [1-1-7] 아직 회수되지 않은 자식들을 먼저 풀어 준다
+     목적 : 부모가 wait 없이 먼저 종료하는 경우 자식이 Destroy_sema 에서
+            영원히 대기하는 것을 막는다
+     참고 : Pintos manual 3.3.4 wait - 부모가 기다리지 않고 종료할 수 있다
+     주의 : 자식 목록에서 제거하지는 않는다. 이 스레드는 곧 사라지므로
+            목록 자체가 함께 사라진다 */
+  for (e = list_begin (&cur->Child_list); e != list_end (&cur->Child_list);
+       e = list_next (e))
+    sema_up (&list_entry (e, struct thread, Child_elem)->Destroy_sema);
+
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
   pd = cur->pagedir;
   if (pd != NULL) 
     {
+      /* [1-1-5] Process Termination Message : 종료 메시지 출력
+         목적 : 사용자 프로세스가 종료될 때 "이름: exit(상태)" 형식으로 출력한다
+         입력 : cur->name        - 1-1-2 에서 명령행 인자를 뗀 프로그램 이름
+                cur->exit_status - exit() 이 기록했거나 초기값 -1
+         출력 : 콘솔에 종료 메시지 한 줄
+         참고 : Pintos manual 3.3.2, proj1 슬라이드 31 - 32
+         주의 : pd != NULL 조건 안에 두어야 커널 스레드에는 출력되지 않는다
+                매뉴얼 3.3.2 가 사용자 프로세스가 아닌 커널 스레드 종료 시에는
+                출력하지 말라고 명시한다
+                halt 로 종료할 때는 shutdown_power_off() 가 곧바로 전원을 내려
+                이 함수 자체가 호출되지 않으므로 별도 분기가 필요 없다 */
+      printf ("%s: exit(%d)\n", cur->name, cur->exit_status);
+
       /* Correct ordering here is crucial.  We must set
          cur->pagedir to NULL before switching page directories,
          so that a timer interrupt can't switch back to the
@@ -113,6 +278,21 @@ process_exit (void)
       cur->pagedir = NULL;
       pagedir_activate (NULL);
       pagedir_destroy (pd);
+    }
+
+  /* [1-1-7] 부모에게 종료를 알리고, 회수될 때까지 이 자리에서 대기한다
+     목적 : 부모가 process_wait() 에서 exit_status 를 읽어 가기 전에
+            이 스레드의 struct thread 가 해제되지 않도록 붙잡는다
+     참고 : Pintos manual 3.3.4 wait
+     주의 : 사용자 프로세스에만 적용한다
+            커널 스레드까지 여기서 대기하면 부모가 없어 영원히 멈추고
+            Pintos 가 전원을 내리지 못한다
+            부모가 이미 종료한 경우에는 위 반복문에서 Destroy_sema 가
+            미리 올라가 있으므로 곧바로 통과한다 */
+  if (is_user_process)
+    {
+      sema_up (&cur->Exit_sema);
+      sema_down (&cur->Destroy_sema);
     }
 }
 
@@ -215,6 +395,17 @@ load (const char *file_name, void (**eip) (void), void **esp)
   bool success = false;
   int i;
 
+  /* [1-1-2] Argument Passing : 실행 파일 이름 분리용 버퍼
+     목적 : filesys_open() 에 명령행 전체가 아닌 첫 토큰만 넘겨
+            "echo a b" 같은 입력에서도 실행 파일 echo 를 찾도록 한다
+     입력 : file_name - start_process() 가 넘긴 명령행 전체
+     출력 : Prog_name 에 첫 토큰만 남는다
+     참고 : Pintos manual 3.3.3 Argument Passing, proj1 슬라이드 48
+     주의 : file_name 은 const 이고 이후 1-1-2 의 스택 구성에서
+            명령행 전체가 그대로 필요하므로 원본을 변형하면 안 된다 */
+  char Prog_name[MAX_CMD_LEN];
+  char *save_ptr;
+
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
   if (t->pagedir == NULL) 
@@ -222,10 +413,18 @@ load (const char *file_name, void (**eip) (void), void **esp)
   process_activate ();
 
   /* Open executable file. */
-  file = filesys_open (file_name);
+
+  /* [1-1-2] 수정 : filesys_open() 대상을 file_name 에서 Prog_name 으로 교체
+     변경 내용 : 명령행에서 첫 토큰을 잘라 낸 뒤 그 이름으로 실행 파일을 연다
+     변경 이유 : 기존 코드는 "echo a b" 라는 이름의 파일을 찾으므로 항상 실패한다
+     영향 범위 : 인자가 없는 명령행에서는 첫 토큰이 곧 전체 문자열이므로 동작이 같다 */
+  strlcpy (Prog_name, file_name, sizeof Prog_name);
+  strtok_r (Prog_name, " ", &save_ptr);
+
+  file = filesys_open (Prog_name);
   if (file == NULL) 
     {
-      printf ("load: %s: open failed\n", file_name);
+      printf ("load: %s: open failed\n", Prog_name);
       goto done; 
     }
 
@@ -304,6 +503,15 @@ load (const char *file_name, void (**eip) (void), void **esp)
   /* Set up stack. */
   if (!setup_stack (esp))
     goto done;
+
+  /* [1-1-2] 수정 : 스택 페이지 할당 직후 인자를 실제로 쌓는다
+     변경 내용 : setup_stack() 이 *esp 를 PHYS_BASE 로 설정한 뒤
+                construct_stack() 을 호출해 argc / argv 를 구성
+     변경 이유 : 기존 코드는 빈 스택만 만들어 _start() 가 argc, argv 를
+                PHYS_BASE 위쪽에서 읽다가 page fault 를 일으킨다
+     영향 범위 : setup_stack() 실패 시에는 호출되지 않는다
+     참고 : Pintos manual 3.5, proj1 슬라이드 35 */
+  construct_stack (file_name, esp);
 
   /* Start address. */
   *eip = (void (*) (void)) ehdr.e_entry;
@@ -442,6 +650,81 @@ setup_stack (void **esp)
         palloc_free_page (kpage);
     }
   return success;
+}
+
+/* [1-1-2] Argument Passing : 사용자 스택 구성
+   목적 : setup_stack() 이 할당한 4 KB 스택 페이지 위에 80x86 calling convention 에
+          맞추어 인자 문자열, word align, null sentinel, argv 포인터 배열,
+          argv, argc, fake return address 순으로 데이터를 쌓는다
+   입력 : cmdline - load() 가 받은 원본 명령행 문자열
+          esp     - setup_stack() 직후 PHYS_BASE 를 가리키는 스택 포인터
+   출력 : *esp 가 fake return address 를 가리키도록 갱신된다
+   참고 : Pintos manual 3.5 (80x86 Calling Convention), proj1 슬라이드 35 - 41
+   주의 : 문자열은 역순으로 push 해야 hex_dump 결과가 매뉴얼 예시와 일치한다
+          strtok_r() 은 대상을 변형하므로 cmdline 사본을 만들어 사용한다
+          argv[argc] 자리에 null sentinel 을 반드시 넣어야 args.c 의
+          i <= argc 순회에서 null 이 출력된다 */
+static void
+construct_stack (const char *cmdline, void **esp)
+{
+  char Cmd_copy[MAX_CMD_LEN];
+  char *Argv[MAX_ARGC];
+  char *token;
+  char *save_ptr;
+  char **argv_base;
+  int argc = 0;
+  int i;
+  int len;
+
+  /* 1. 명령행을 사본에 복사한 뒤 공백 기준으로 토큰 분리
+        연속 공백은 strtok_r() 이 하나의 구분자로 처리한다 */
+  strlcpy (Cmd_copy, cmdline, sizeof Cmd_copy);
+  for (token = strtok_r (Cmd_copy, " ", &save_ptr);
+       token != NULL && argc < MAX_ARGC;
+       token = strtok_r (NULL, " ", &save_ptr))
+    Argv[argc++] = token;
+
+  /* 2. 인자 문자열을 역순으로 push 하고, 스택상의 주소를 다시 Argv 에 기록 */
+  for (i = argc - 1; i >= 0; i--)
+    {
+      len = strlen (Argv[i]) + 1;
+      *esp = (uint8_t *) *esp - len;
+      memcpy (*esp, Argv[i], len);
+      Argv[i] = *esp;
+    }
+
+  /* 3. word align : esp 를 4의 배수로 내림 */
+  while ((uintptr_t) *esp % 4 != 0)
+    {
+      *esp = (uint8_t *) *esp - 1;
+      * (uint8_t *) *esp = 0;
+    }
+
+  /* 4. argv[argc] 자리에 null sentinel push */
+  *esp = (uint8_t *) *esp - 4;
+  * (uint32_t *) *esp = 0;
+
+  /* 5. argv[i] 주소를 역순으로 push */
+  for (i = argc - 1; i >= 0; i--)
+    {
+      *esp = (uint8_t *) *esp - 4;
+      * (char **) *esp = Argv[i];
+    }
+
+  /* 6. argv (argv[0] 이 놓인 주소) push */
+  argv_base = *esp;
+  *esp = (uint8_t *) *esp - 4;
+  * (char ***) *esp = argv_base;
+
+  /* 7. argc push */
+  *esp = (uint8_t *) *esp - 4;
+  * (int *) *esp = argc;
+
+  /* 8. fake return address push
+        _start() 는 일반 함수처럼 호출된 것이 아니지만, calling convention 상
+        반환 주소 자리가 있어야 argc 와 argv 의 오프셋이 맞는다 */
+  *esp = (uint8_t *) *esp - 4;
+  * (uint32_t *) *esp = 0;
 }
 
 /* Adds a mapping from user virtual address UPAGE to kernel

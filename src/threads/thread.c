@@ -183,6 +183,18 @@ thread_create (const char *name, int priority,
   init_thread (t, name, priority);
   tid = t->tid = allocate_tid ();
 
+#ifdef USERPROG
+  /* [1-1-7] exec, wait : 생성된 스레드를 부모의 자식 목록에 등록
+     목적 : 이후 process_wait() 이 tid 로 자식을 찾을 수 있게 한다
+     참고 : proj1 슬라이드 44 - wait 은 자식 스레드 ID 가 유효한지 확인해야 한다
+     주의 : thread_create() 은 thread_init() 이 끝난 뒤에만 호출되므로
+            이 시점에는 thread_current() 를 안전하게 쓸 수 있다
+            커널 스레드도 함께 등록되지만 pagedir 이 NULL 이라
+            종료 메시지나 wait 대상이 되지 않으므로 문제가 없다 */
+  t->Parent = thread_current ();
+  list_push_back (&thread_current ()->Child_list, &t->Child_elem);
+#endif
+
   /* Stack frame for kernel_thread(). */
   kf = alloc_frame (t, sizeof *kf);
   kf->eip = NULL;
@@ -463,6 +475,22 @@ init_thread (struct thread *t, const char *name, int priority)
   t->stack = (uint8_t *) t + PGSIZE;
   t->priority = priority;
   t->magic = THREAD_MAGIC;
+
+#ifdef USERPROG
+  /* [1-1-7] exec, wait : 부모-자식 관리 필드 초기화
+     목적 : 자식 목록과 세 개의 세마포어를 사용 가능한 상태로 만든다
+     참고 : threads/thread.h 의 Child_list, Load_sema, Exit_sema, Destroy_sema
+     주의 : 여기서는 thread_current() 를 호출하지 않는다
+            thread_init() 이 최초 스레드에 대해 이 함수를 부를 때는
+            아직 현재 스레드를 안전하게 조회할 수 없기 때문이다
+            부모 등록은 thread_create() 에서 수행한다 */
+  t->Parent = NULL;
+  t->is_loaded = false;
+  list_init (&t->Child_list);
+  sema_init (&t->Load_sema, 0);
+  sema_init (&t->Exit_sema, 0);
+  sema_init (&t->Destroy_sema, 0);
+#endif
 
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);

@@ -5,6 +5,13 @@
 #include <list.h>
 #include <stdint.h>
 
+/* [1-1-7] exec, wait : 부모-자식 동기화에 세마포어를 사용하기 위해 포함
+   참고 : threads/synch.h
+   주의 : synch.h 는 thread.h 를 포함하지 않으므로 순환 참조가 생기지 않는다
+          struct lock 안의 struct thread * 는 불완전 타입으로도 문제가 없다 */
+#include "threads/synch.h"
+#include <stdbool.h>
+
 /* States in a thread's life cycle. */
 enum thread_status
   {
@@ -96,6 +103,34 @@ struct thread
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
+
+    /* [1-1-5] Process Termination Message : 종료 상태 저장
+       목적 : exit() 이 넘긴 종료 상태를 process_exit() 이 출력할 때까지 보관한다
+       참고 : Pintos manual 3.3.2, proj1 슬라이드 31 - 32
+              슬라이드 32 가 "프로세스 이름은 struct thread 를 참고하라" 고 안내하며,
+              종료 상태도 같은 구조체에 두는 것이 자연스럽다
+       주의 : 초기값은 start_process() 에서 -1 로 설정한다
+              page fault 등으로 강제 종료되는 경로는 exit() 을 거치지 않는데,
+              그때 기대되는 종료 코드가 -1 이기 때문이다
+              1-1-7 의 wait 구현에서 부모가 이 값을 읽어 간다 */
+    int exit_status;                    /* Exit status for termination message. */
+
+    /* [1-1-7] exec, wait : 부모-자식 프로세스 관리
+       목적 : 부모가 자식의 적재 결과와 종료 상태를 기다릴 수 있게 한다
+       참고 : Pintos manual 3.3.4 exec / wait, proj1 슬라이드 44
+       주의 : Load_sema  - 부모가 process_execute() 에서 자식의 load 완료를 기다린다
+              Exit_sema  - 부모가 process_wait() 에서 자식의 종료를 기다린다
+              Destroy_sema - 자식이 부모에게 종료 상태를 넘겨줄 때까지
+                             자신의 struct thread 가 해제되지 않도록 붙잡는다
+              세 개를 분리한 이유는 각각 기다리는 주체와 시점이 다르기 때문이다
+              이 구조는 Prj1-2 와 Project 2 에서 그대로 재사용된다 */
+    struct thread *Parent;              /* Parent process. */
+    struct list Child_list;             /* List of child processes. */
+    struct list_elem Child_elem;        /* Element in parent's Child_list. */
+    bool is_loaded;                     /* True if executable loaded. */
+    struct semaphore Load_sema;         /* Signals load completion. */
+    struct semaphore Exit_sema;         /* Signals process exit. */
+    struct semaphore Destroy_sema;      /* Waits until parent reaps status. */
 #endif
 
     /* Owned by thread.c. */
