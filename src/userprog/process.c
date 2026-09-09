@@ -7,6 +7,13 @@
 #include <string.h>
 #include "userprog/gdt.h"
 #include "userprog/pagedir.h"
+
+/* [1-2-7] 파일 시스템 동기화 : 전역 락을 쓰기 위해 포함
+   목적 : load () 와 process_exit () 이 시스템 콜과 같은 락으로
+          파일 시스템 접근을 직렬화한다
+   참고 : userprog/syscall.h 의 extern struct lock Filesys_lock
+   주의 : 실체와 초기화는 userprog/syscall.c 에 있다 */
+#include "userprog/syscall.h"
 #include "userprog/tss.h"
 #include "filesys/directory.h"
 #include "filesys/file.h"
@@ -152,12 +159,35 @@ start_process (void *file_name_)
             exception.c 를 고치는 대신 초기값으로 해결한다 */
   thread_current ()->exit_status = -1;
 
+  /* [1-2-1] File Descriptor : 파일 디스크립터 테이블 할당
+     목적 : 이 프로세스가 열게 될 파일들을 담을 4 kB 페이지를 확보한다
+     입력 : 없음
+     출력 : thread_current ()->Fd_table 이 0 으로 채워진 페이지를 가리킨다
+     참고 : proj1 슬라이드 69 - 각 스레드가 독립적인 파일 디스크립터를 관리한다
+            threads/palloc.h 의 void *palloc_get_page (enum palloc_flags)
+     주의 : PAL_ZERO 로 받아야 FD_BASE 부터 FD_MAX 까지 모든 칸이 NULL 이 된다
+            빈 칸 판정을 NULL 로 하기 때문에 이 초기화가 곧 정확성 조건이다
+            커널 풀에서 페이지를 받으므로 PAL_USER 를 주지 않는다
+            메모리가 부족해 실패하면 적재 실패와 똑같이 처리한다
+            multi-oom 처럼 메모리를 고갈시키는 테스트에서 실제로 발생할 수 있다 */
+  thread_current ()->Fd_table = palloc_get_page (PAL_ZERO);
+
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load (file_name, &if_.eip, &if_.esp);
+
+  /* [1-2-1] 수정 : 테이블 확보 실패를 적재 실패와 동일하게 취급
+     변경 내용 : load() 호출 앞에 Fd_table 확보 여부를 검사하는 조건을 붙였다
+     변경 이유 : 파일 디스크립터 테이블이 없으면 open 이후의 시스템 콜을
+                정상 처리할 수 없으므로, 프로그램을 시작시켜서는 안 된다
+     영향 범위 : 실패 시 아래 기존 경로가 그대로 동작한다
+                is_loaded 가 false 로 기록되고 Load_sema 가 올라가므로
+                부모의 exec 는 -1 을 받는다
+     주의 : && 의 단축 평가 덕분에 테이블이 없으면 load() 자체를 부르지 않는다 */
+  success = thread_current ()->Fd_table != NULL
+            && load (file_name, &if_.eip, &if_.esp);
 
   /* [1-1-7] 수정 : 적재 결과를 부모에게 알린다
      변경 내용 : load() 결과를 is_loaded 에 기록하고 Load_sema 를 올린다
@@ -239,6 +269,7 @@ process_exit (void)
      pagedir 은 아래에서 NULL 로 바뀌므로 판정에 쓸 수 없다 */
   bool is_user_process = (cur->pagedir != NULL);
   struct list_elem *e;
+  int fd;
 
   /* [1-1-7] 아직 회수되지 않은 자식들을 먼저 풀어 준다
      목적 : 부모가 wait 없이 먼저 종료하는 경우 자식이 Destroy_sema 에서
@@ -249,6 +280,63 @@ process_exit (void)
   for (e = list_begin (&cur->Child_list); e != list_end (&cur->Child_list);
        e = list_next (e))
     sema_up (&list_entry (e, struct thread, Child_elem)->Destroy_sema);
+
+  /* [1-2-1] File Descriptor : 열린 파일 정리와 테이블 반납
+     목적 : 종료하는 프로세스가 열어 둔 파일을 모두 닫고 페이지를 반납한다
+     입력 : cur->Fd_table
+     출력 : 모든 칸이 닫히고 Fd_table 이 NULL 이 된다
+     참고 : Pintos manual 3.3.2 - 프로세스가 종료되면 열린 파일 디스크립터는
+            운영체제가 대신 닫아 주어야 한다
+            filesys/file.h 의 void file_close (struct file *)
+     주의 : 0 번과 1 번 칸은 콘솔 몫이라 항상 NULL 이므로 FD_BASE 부터 순회한다
+            여기서 닫지 않으면 파일의 inode 참조가 남아 remove 이후에도
+            디스크 공간이 회수되지 않는다
+            커널 스레드는 Fd_table 이 NULL 이므로 통째로 건너뛴다
+            페이지 반납 뒤 NULL 로 되돌려, 남은 종료 경로에서 해제된 메모리를
+            다시 참조하지 않도록 한다 */
+  /* [1-2-7] 수정 : 종료 시 파일 정리도 같은 락으로 보호
+     변경 내용 : 열린 파일을 닫는 반복문과 실행 파일 닫기를
+                Filesys_lock 으로 감쌌다
+     변경 이유 : 닫기는 inode 참조 수를 줄이고 필요하면 디스크 공간을 회수한다
+                다른 프로세스의 파일 접근과 겹치면 자료구조가 깨진다
+     영향 범위 : 테이블 페이지 반납은 프로세스 자신의 자료라 락 밖에서 한다
+     주의 : 커널 스레드는 Fd_table 과 Exec_file 이 모두 NULL 이라
+            락 자체를 건드리지 않고 지나간다 */
+  if (cur->Fd_table != NULL)
+    {
+      lock_acquire (&Filesys_lock);
+
+      for (fd = FD_BASE; fd < FD_MAX; fd++)
+        if (cur->Fd_table[fd] != NULL)
+          {
+            file_close (cur->Fd_table[fd]);
+            cur->Fd_table[fd] = NULL;
+          }
+
+      lock_release (&Filesys_lock);
+
+      palloc_free_page (cur->Fd_table);
+      cur->Fd_table = NULL;
+    }
+
+  /* [1-2-6] Denying Writes to Executables : 실행 파일 반납
+     목적 : 프로세스가 끝났으므로 실행 파일을 닫아 쓰기 금지를 푼다
+     입력 : cur->Exec_file
+     출력 : 파일이 닫히고 Exec_file 이 NULL 이 된다
+     참고 : proj1 슬라이드 72, Pintos manual 3.3.5
+     주의 : file_close () 가 내부에서 file_allow_write () 를 부르므로
+            따로 허용 처리를 하지 않는다
+            커널 스레드와 적재에 실패한 프로세스는 NULL 이라 건너뛴다
+            자식이 아직 돌고 있어도 각자 자기 실행 파일을 따로 붙잡고 있으므로
+            부모가 먼저 끝나도 자식 쪽 금지는 풀리지 않는다 (rox-multichild) */
+  if (cur->Exec_file != NULL)
+    {
+      lock_acquire (&Filesys_lock);
+      file_close (cur->Exec_file);
+      lock_release (&Filesys_lock);
+
+      cur->Exec_file = NULL;
+    }
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
@@ -406,6 +494,20 @@ load (const char *file_name, void (**eip) (void), void **esp)
   char Prog_name[MAX_CMD_LEN];
   char *save_ptr;
 
+  /* [1-2-7] 수정 : 적재 전 구간 전체를 파일 시스템 락으로 보호
+     변경 내용 : load () 첫머리에서 Filesys_lock 을 잡고, done 라벨에서 푼다
+     변경 이유 : load () 는 filesys_open () 과 file_read () 로 파일 시스템을
+                직접 사용한다, 시스템 콜 쪽만 잠그면 exec 로 프로세스가
+                뜨는 도중과 다른 프로세스의 파일 접근이 겹쳐 깨진다
+     영향 범위 : 락을 잡기 전에는 goto done 이 없으므로 잡지 않은 락을
+                푸는 경우가 생기지 않는다
+     주의 : 첫 goto done 보다 앞에서 잡아야 한다
+            pagedir_create () 실패 경로도 done 을 지나가기 때문이다
+            적재에 실패하면 start_process () 가 thread_exit () 을 부르고
+            process_exit () 이 다시 이 락을 잡으므로,
+            반드시 done 에서 먼저 풀고 반환해야 한다 */
+  lock_acquire (&Filesys_lock);
+
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
   if (t->pagedir == NULL) 
@@ -427,6 +529,20 @@ load (const char *file_name, void (**eip) (void), void **esp)
       printf ("load: %s: open failed\n", Prog_name);
       goto done; 
     }
+
+  /* [1-2-6] Denying Writes to Executables : 실행 파일 쓰기 금지
+     목적 : 프로세스가 도는 동안 자신의 실행 파일이 수정되지 않게 한다
+     입력 : file - 방금 연 실행 파일
+     출력 : 파일이 쓰기 금지 상태가 되고 Exec_file 에 보관된다
+     참고 : proj1 슬라이드 72 - Denying Writes to Executable files
+            Pintos manual 3.3.5 - void file_deny_write (struct file *)
+     주의 : 금지 상태는 inode 에 걸리므로, 다른 프로세스가 같은 파일을
+            새로 열어 얻은 fd 로 써도 0 바이트만 기록된다 (rox-child)
+            파일을 닫으면 금지가 풀리므로 여기서 닫으면 안 되고,
+            프로세스가 끝나는 process_exit () 까지 열어 둔 채로 붙잡는다
+            그래서 아래 done 라벨의 file_close () 를 실패한 경우로 한정한다 */
+  file_deny_write (file);
+  thread_current ()->Exec_file = file;
 
   /* Read and verify executable header. */
   if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
@@ -520,7 +636,25 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
  done:
   /* We arrive here whether the load is successful or not. */
-  file_close (file);
+
+  /* [1-2-6] 수정 : 적재에 성공한 실행 파일은 닫지 않는다
+     변경 내용 : 무조건 부르던 file_close () 를 실패한 경우로 한정하고,
+                이때 Exec_file 도 NULL 로 되돌린다
+     변경 이유 : file_close () 는 내부에서 file_allow_write () 를 부른다
+                여기서 닫으면 방금 건 쓰기 금지가 곧바로 풀려 rox 계열이 깨진다
+     영향 범위 : 실패 경로의 동작은 그대로다
+                file_close (NULL) 은 아무 일도 하지 않으므로
+                파일을 열기 전에 goto done 으로 온 경우도 안전하다
+     주의 : 성공한 파일을 닫는 책임은 process_exit () 로 넘어갔다
+            여기서 닫고 Exec_file 도 남겨 두면 종료 시 이중 해제가 된다 */
+  if (!success)
+    {
+      thread_current ()->Exec_file = NULL;
+      file_close (file);
+    }
+
+  lock_release (&Filesys_lock);
+
   return success;
 }
 

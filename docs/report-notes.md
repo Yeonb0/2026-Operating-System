@@ -573,3 +573,622 @@ Prj1-1 채점 대상 21개는 전부 만점이다. 배점은 args 계열 3점씩
 - echo x 실행 화면
 - additional 10 20 62 40 → 55 62 (보고서 V.A 필수)
 - 최종 make check 결과 (제출 전 필수)
+
+---
+
+## 1-2-1 File Descriptor 자료구조
+
+### II.A 구현 이유와 기대 결과
+
+- 이유 : 현재 read 와 write 는 fd 가 0 과 1 일 때만 동작하고 나머지 번호에는 -1 을 돌려준다. 사용자 프로그램이 파일을 열고 그 결과를 번호로 다시 지목하려면, 프로세스마다 fd 번호와 `struct file *` 을 연결하는 표가 먼저 있어야 한다
+- 기대 결과 : 이 단계만으로 통과하는 테스트는 없다. 1-2-2 이후의 create, open, close, read, write, seek, tell 이 올라설 토대를 만들고, 기존 21개 동작에는 영향을 주지 않는다
+
+### II.B File Descriptor 자료구조와 선택 이유
+
+Pintos 의 fd 는 표준 C 의 `FILE *` 에 대응하는 정수 번호이며 open 의 반환값이다. 조교 슬라이드 69 에 따르면 각 스레드가 서로 독립적인 fd 집합을 관리하고 0 은 STDIN, 1 은 STDOUT 이 선점하므로, 실제 파일에는 2번부터 배정한다.
+
+| 후보 | 장점 | 채택하지 않은 이유 |
+| --- | --- | --- |
+| struct thread 안의 고정 배열 | 할당이 실패할 일이 없다 | 128칸만 잡아도 512바이트다. thread.h 원문 주석이 `struct thread` 를 1 kB 아래로 유지하고 큰 배열은 malloc 이나 palloc_get_page 로 잡으라고 명시한다 |
+| 리스트 + fd 노드 | 열린 파일 수만큼만 메모리를 쓴다 | fd 로 `struct file *` 을 찾는 연산이 O(n) 이고, close 마다 노드 할당과 해제를 관리해야 한다 |
+| **포인터 한 개 + 페이지 한 장 (채택)** | 구조체는 4바이트만 커지고 조회가 배열 인덱싱이라 O(1) 이다. PAL_ZERO 로 전체 칸을 한 번에 NULL 로 만들 수 있고 해제도 페이지 반납 한 번이다 | - |
+
+채택한 형태는 `struct file **Fd_table` 한 개다. 실체는 프로세스 적재 시점에 `palloc_get_page (PAL_ZERO)` 로 잡는 4 kB 페이지이며, `PGSIZE / sizeof (struct file *)` 로 1024칸이 된다.
+
+| 상수 | 값 | 의미 |
+| --- | --- | --- |
+| FD_BASE | 2 | 실제 파일에 배정되는 첫 번호, 0 과 1 은 콘솔 예약 |
+| FD_MAX | 1024 | 테이블 한 페이지에 들어가는 항목 수 |
+
+### III.B 개발 방법
+
+| 구분 | 내용 |
+| --- | --- |
+| 수정 소스코드 | src/threads/thread.h, src/threads/thread.c, src/userprog/process.c |
+| 추가 자료구조 | struct thread 의 `struct file **Fd_table` |
+| 추가 상수 | FD_BASE, FD_MAX |
+| 추가 include | threads/vaddr.h (PGSIZE) |
+| 수정 함수 | init_thread (), start_process (), process_exit () |
+| 사용한 내장 함수 | palloc_get_page (), palloc_free_page () — threads/palloc.h, file_close () — filesys/file.h |
+
+변경 내용
+
+1. thread.h : USERPROG 블록의 1-1-7 필드 아래에 `Fd_table` 포인터를 추가하고, fd 번호 규약을 FD_BASE, FD_MAX 상수로 분리했다. PGSIZE 를 쓰기 위해 threads/vaddr.h 를 포함했다
+2. thread.c : `init_thread ()` 에서 `Fd_table` 을 NULL 로 초기화한다
+3. process.c : `start_process ()` 에서 `palloc_get_page (PAL_ZERO)` 로 페이지를 잡고, 실패하면 적재 실패와 같은 경로로 종료한다. `process_exit ()` 에서 FD_BASE 부터 열린 파일을 모두 `file_close ()` 한 뒤 페이지를 반납한다
+
+### 설계 판단
+
+- `struct file` 을 불완전 타입인 채로 두고 filesys/file.h 를 thread.h 에 포함하지 않았다. 포인터의 크기는 타입이 불완전해도 확정되므로 헤더 의존을 늘릴 이유가 없다
+- FD_MAX 를 `((int) (PGSIZE / sizeof (struct file *)))` 로 캐스팅했다. `sizeof` 결과는 부호 없는 정수라 `int fd` 와 비교할 때 빌드 옵션 `-W` 의 부호 비교 경고가 발생하기 때문이다
+- 다음 fd 번호를 기억하는 카운터는 두지 않았다. 카운터만 증가시키면 close 로 비운 칸을 재사용하지 못해 fd 가 고갈된다. open 에서 FD_BASE 부터 빈 칸을 찾으면 재사용과 고갈 방지가 동시에 해결된다
+- 테이블 할당 위치를 `init_thread ()` 가 아니라 `start_process ()` 로 잡았다. 커널 스레드는 파일 디스크립터를 쓰지 않는데, 모든 스레드가 4 kB 페이지를 하나씩 더 물면 메모리 압박 상황에서 손해만 커진다
+- 할당 실패는 적재 실패와 동일하게 처리한다. `success = Fd_table != NULL && load (...)` 형태로 두어, 이미 검증된 1-1-7 의 실패 경로(is_loaded = false, Load_sema 해제, exec 가 -1 반환)를 그대로 재사용했다. 별도의 종료 경로를 새로 만들지 않은 것이 핵심이다
+- 종료 시 파일을 닫는 책임은 `process_exit ()` 에 두었다. 정상 exit 뿐 아니라 page fault 로 인한 강제 종료도 이 함수를 거치므로, 1-1-5 에서 종료 메시지 출력 지점을 한곳에 모은 것과 같은 이유다. 닫지 않으면 inode 참조가 남아 remove 이후에도 공간이 회수되지 않는다
+
+### IV.A Flow Chart 소재
+
+```
+프로세스 생성
+  process_execute()  [userprog/process.c]
+    └─ thread_create()  [threads/thread.c]
+         └─ init_thread()
+              └─ Fd_table = NULL
+    └─ start_process()
+         ├─ Fd_table = palloc_get_page(PAL_ZERO)     ← 1024칸, 전부 NULL
+         └─ success = (Fd_table != NULL) && load(...)
+              └─ 실패 시 is_loaded = false → 부모의 exec 가 -1
+
+파일 사용 (1-2-2 이후)
+  open("sample.txt")
+    ├─ filesys_open()  [filesys/filesys.c]
+    └─ FD_BASE 부터 빈 칸 탐색 → 그 인덱스를 fd 로 반환
+
+프로세스 종료
+  process_exit()
+    ├─ 자식들의 Destroy_sema 해제                    (1-1-7)
+    ├─ FD_BASE ~ FD_MAX 순회하며 file_close()        (1-2-1)
+    ├─ palloc_free_page(Fd_table)
+    └─ "이름: exit(상태)" 출력                        (1-1-5)
+```
+
+### IV.B 개발상 발생한 문제와 해결책
+
+- `make` 출력에 경고 2건이 남아 있으나 둘 다 배포본 원본이다. `threads/init.c` 의 noreturn 함수 반환 경로 지적과 `lib/kernel/debug.c:82` 의 `__builtin_frame_address (1)` 지적으로, 이번 변경과 무관해 손대지 않았다
+
+### 검증 기록
+
+| 항목 | 결과 |
+| --- | --- |
+| 빌드 | 경고 증가 없음 (배포본 경고 2건 유지) |
+| echo x | `echo: exit(0)`, `Console: 894 characters`, page fault 0 — 1-1-9 시점과 동일 |
+| 회귀 | 지침에 따라 1-2-8 에서 일괄 수행 |
+
+---
+
+## 1-2-2 create, remove
+
+### II.A 구현 이유와 기대 결과
+
+- 이유 : 파일을 열거나 읽으려면 먼저 파일이 존재해야 한다. create 와 remove 는 파일 시스템 시스템 콜 중 fd 를 쓰지 않는 유일한 쌍이라, 파일 디스크립터 계층 없이 먼저 구현할 수 있다
+- 기대 결과 : create-normal, create-empty, create-null, create-bad-ptr, create-long, create-exists, create-bound 7개 통과. remove 는 단독 테스트가 없고 tests/filesys/base/syn-remove 에서 확인된다
+
+### II.B 시스템 콜 설명
+
+- create : 주어진 이름으로 initial_size 바이트 크기의 빈 파일을 만들고 성공 여부를 반환한다. 파일을 만들기만 할 뿐 열지는 않으므로 fd 는 배정하지 않는다. 이미 같은 이름이 있으면 false 를 돌려준다
+- remove : 주어진 이름의 파일을 지우고 성공 여부를 반환한다. 파일이 열려 있어도 삭제는 성공하며, 이미 연 프로세스는 자신의 fd 로 계속 접근할 수 있다
+
+### 테스트가 요구하는 동작
+
+| 테스트 | 전달 값 | 기대 결과 |
+| --- | --- | --- |
+| create-normal | "quux.dat", 0 | true |
+| create-empty | "", 0 | false (프로세스는 정상 종료) |
+| create-null | NULL | exit(-1) |
+| create-bad-ptr | 0x20101234 | exit(-1) |
+| create-long | 511자 이름 | false |
+| create-exists | 같은 이름 재생성 | 두 번째는 false |
+| create-bound | 페이지 경계에 걸친 이름 | true |
+
+확정된 요구사항
+
+1. 잘못된 포인터는 값을 읽기 전에 걸러야 한다 (create-null, create-bad-ptr)
+2. 이름이 비었거나 너무 길면 프로세스를 죽이지 않고 false 만 반환해야 한다 (create-empty, create-long)
+3. 이름이 페이지 경계를 넘어가도 끝까지 읽어야 한다 (create-bound)
+
+### III.B 개발 방법
+
+| 구분 | 내용 |
+| --- | --- |
+| 수정 소스코드 | src/userprog/syscall.c, src/userprog/syscall.h |
+| 추가 함수 | bool create (const char \*file, unsigned initial_size), bool remove (const char \*file) |
+| 수정 함수 | syscall_handler () |
+| 추가 include | filesys/filesys.h |
+| 사용한 내장 함수 | filesys_create (), filesys_remove () — filesys/filesys.c |
+
+변경 내용
+
+- SYS_CREATE, SYS_REMOVE 분기를 채우고 반환값을 f->eax 에 저장했다 (슬라이드 28)
+- create 는 인자가 2개이므로 `get_argument (f->esp, Arg, 2)` 로 꺼낸다
+- 두 함수 모두 이름 포인터를 1-1-7 에서 만든 check_string () 으로 먼저 검증한다
+
+### 설계 판단
+
+- 이름 길이 검사를 시스템 콜 계층에 두지 않았다. `dir_add ()` 가 빈 이름과 NAME_MAX 초과를 이미 걸러 false 를 돌려주므로, 같은 규칙을 두 곳에 두면 나중에 파일 시스템 쪽이 바뀔 때 어긋난다. create-empty 와 create-long 이 이 경로를 그대로 확인한다
+- check_string () 을 재사용했다. exec 에서 이미 검증된 함수라 create-bad-ptr 과 create-bound 가 요구하는 페이지 경계 처리가 그대로 적용된다. 시작 주소만 보는 검사로는 create-bound 를 통과할 수 없다
+- remove 에서 열린 fd 를 뒤져 닫지 않는다. 매뉴얼 3.3.5 는 삭제된 파일이라도 이미 연 참조는 유효하게 유지되어야 한다고 명시한다. 실제 공간 회수는 마지막 참조가 닫힐 때 inode 계층이 처리한다
+- case 배치는 lib/syscall-nr.h 의 번호 순서가 아니라 기존 분기 뒤에 파일 관련 시스템 콜끼리 모이도록 했다. switch 는 순서와 무관하게 동작하고, 1-2 에서 추가되는 분기를 한곳에서 읽을 수 있는 편이 낫다
+- 파일 시스템 접근에 대한 lock 은 아직 넣지 않는다. 1-2-7 에서 임계 구역을 한 번에 정리한다
+
+### IV.A Flow Chart 소재
+
+```
+create("quux.dat", 0)  [사용자]
+  └─ int $0x30
+       └─ syscall_handler()
+            ├─ check_address(f->esp, 4)
+            ├─ syscall_number = SYS_CREATE
+            └─ case SYS_CREATE
+                 ├─ get_argument(f->esp, Arg, 2)
+                 └─ create(Arg[0], Arg[1])
+                      ├─ check_string(file)      ← NULL / 잘못된 주소면 exit(-1)
+                      └─ filesys_create(file, initial_size)
+                           ├─ free_map_allocate + inode_create
+                           └─ dir_add()          ← 빈 이름 / 길이 초과면 false
+                                └─ 결과를 f->eax 로 반환
+```
+
+### 검증 기록
+
+| 항목 | 결과 |
+| --- | --- |
+| 빌드 | 우리 코드에서 경고 0건 |
+| create-normal, create-empty, create-null, create-bad-ptr, create-long, create-exists, create-bound | 7개 모두 pass |
+
+create-empty 는 `create(""): 0`, create-long 은 `create("x..."): 0` 을 출력하고 프로세스는 exit(0) 으로 끝났다. 길이 검사를 시스템 콜 계층에 넣지 않고 dir_add () 에 맡긴 판단이 맞았음을 확인했다.
+
+---
+
+## 1-2-3 open, close, filesize
+
+### II.A 구현 이유와 기대 결과
+
+- 이유 : 1-2-1 에서 만든 Fd_table 은 아직 빈 채로 있다. open 이 fd 를 배정하고 close 가 반납해야 파일 입출력의 진입점과 종료점이 생기며, 그 위에서 read 와 write 를 fd 기반으로 확장할 수 있다
+- 기대 결과 : open-normal, open-missing, open-boundary, open-empty, open-null, open-bad-ptr, open-twice, close-normal, close-twice, close-stdin, close-stdout, close-bad-fd 12개 통과
+
+### II.B 시스템 콜 설명
+
+- open : 이름으로 파일을 열고 이 프로세스의 fd 번호를 배정해 반환한다. 실패하면 -1 이며, 같은 파일을 두 번 열면 서로 다른 fd 와 서로 다른 파일 위치를 갖는다
+- close : fd 가 가리키는 파일을 닫고 테이블의 그 칸을 비운다. 유효하지 않은 fd 는 조용히 무시한다
+- filesize : fd 가 가리키는 파일의 바이트 크기를 반환한다. 유효하지 않은 fd 이면 -1 이다
+
+### 테스트가 요구하는 동작
+
+| 테스트 | 전달 값 | 기대 결과 |
+| --- | --- | --- |
+| open-normal | "sample.txt" | fd >= 2 |
+| open-missing | "no-such-file" | -1, 프로세스는 정상 종료 |
+| open-empty | "" | -1 |
+| open-null / open-bad-ptr | NULL, 0x20101234 | exit(-1) |
+| open-boundary | 페이지 경계에 걸친 이름 | fd > 1 |
+| open-twice | 같은 파일 두 번 | 서로 다른 fd 두 개 |
+| close-normal | 연 파일 닫기 | exit(0) |
+| close-twice | 같은 fd 두 번 닫기 | 조용한 실패 또는 exit(-1) |
+| close-stdin / close-stdout | close(0), close(1) | 조용한 실패 또는 exit(-1) |
+| close-bad-fd | close(0x20101234) | 조용한 실패 또는 exit(-1) |
+
+### III.B 개발 방법
+
+| 구분 | 내용 |
+| --- | --- |
+| 수정 소스코드 | src/userprog/syscall.c, src/userprog/syscall.h |
+| 추가 함수 | get_file () (static), open (), close (), filesize () |
+| 수정 함수 | syscall_handler () |
+| 추가 include | filesys/file.h |
+| 사용한 내장 함수 | filesys_open () — filesys/filesys.c, file_close (), file_length () — filesys/file.c |
+
+변경 내용
+
+- SYS_OPEN, SYS_FILESIZE, SYS_CLOSE 분기를 채웠다. close 는 반환값이 없어 f->eax 를 건드리지 않는다
+- open 은 filesys_open () 이 준 포인터를 FD_BASE 부터 찾은 첫 빈 칸에 넣고 그 인덱스를 반환한다
+- fd 를 struct file * 로 바꾸는 검증을 get_file () 하나로 모았다
+
+### 설계 판단
+
+- fd 검증을 get_file () 한 곳에 모았다. 범위 검사(FD_BASE 이상 FD_MAX 미만), 테이블 존재 검사, 빈 칸 검사를 매번 되풀이하면 한 군데만 빠뜨려도 커널 메모리를 읽는 버그가 된다. close-bad-fd 가 넘기는 0x20101234 는 위쪽 범위 검사가 없으면 그대로 인덱싱된다
+- 잘못된 fd 에 대해 조용한 실패를 택했다. close-twice, close-stdin, close-stdout, close-bad-fd 는 조용한 실패와 exit(-1) 을 모두 정답으로 인정하지만, 프로세스를 죽이지 않는 쪽이 이후 테스트에서 부작용이 적다. 특히 자식 프로세스가 닫기 실수로 죽으면 부모의 wait 결과까지 달라진다
+- close 에서 file_close () 뒤에 칸을 NULL 로 되돌린다. 이것이 close-twice 의 핵심이다. 비우지 않으면 두 번째 close 가 이미 해제된 포인터를 file_close () 에 다시 넘겨 커널이 무너진다
+- 테이블이 가득 찬 경우 open 은 이미 연 파일을 file_close () 한 뒤 -1 을 반환한다. 그냥 -1 만 돌려주면 어떤 fd 로도 닿을 수 없는 열린 파일이 남아 누수가 된다
+- 없는 파일과 빈 이름은 프로세스를 죽이지 않고 -1 만 반환한다. filesys_open () 이 NULL 을 돌려주는 정상적인 실패이며, open-missing 과 open-empty 가 이를 확인한다. 반면 잘못된 포인터는 사용자 메모리 접근 위반이라 check_string () 이 exit(-1) 로 처리한다
+
+### IV.A Flow Chart 소재
+
+```
+open("sample.txt")  [사용자]
+  └─ syscall_handler() → case SYS_OPEN
+       └─ open(Arg[0])
+            ├─ check_string(file)              ← NULL / 잘못된 주소면 exit(-1)
+            ├─ filesys_open(file)              ← 없거나 빈 이름이면 NULL → -1
+            └─ Fd_table[FD_BASE ..] 첫 빈 칸에 저장 → 그 인덱스 반환
+                 └─ 빈 칸이 없으면 file_close() 후 -1
+
+close(fd)
+  └─ get_file(fd)                              ← 범위 밖 / 빈 칸이면 NULL
+       ├─ NULL 이면 조용히 반환
+       └─ file_close() 후 Fd_table[fd] = NULL
+```
+
+### 검증 기록
+
+| 항목 | 결과 |
+| --- | --- |
+| 빌드 | 경고 0건 |
+| open-normal, open-missing, open-boundary, open-empty, open-null, open-bad-ptr, open-twice | 7개 모두 pass |
+| close-normal, close-twice, close-stdin, close-stdout, close-bad-fd | 5개 모두 pass |
+
+close-twice 가 커널 패닉 없이 통과한 것은 close 후 테이블 칸을 NULL 로 되돌리는 처리가 동작한다는 뜻이다.
+
+---
+
+## 1-2-4 read, write 의 파일 디스크립터 확장
+
+### II.A 구현 이유와 기대 결과
+
+- 이유 : 1-1-6 의 read 와 write 는 fd 0 과 1 만 처리하고 나머지는 -1 을 돌려준다. 1-2-3 에서 open 이 fd 를 배정하게 되었으므로, 그 fd 로 실제 파일을 읽고 쓸 수 있어야 파일 입출력이 완성된다
+- 기대 결과 : read-normal, read-zero, read-boundary, read-stdout, read-bad-fd, write-normal, write-zero, write-boundary, write-stdin, write-bad-fd, multi-child-fd 통과
+
+### II.B 시스템 콜 설명
+
+- read : fd 가 0 이면 키보드에서 한 글자씩 읽고, 2 이상이면 Fd_table 에서 찾은 파일에서 size 바이트를 읽는다. 실제로 읽은 바이트 수를 반환한다
+- write : fd 가 1 이면 콘솔에 출력하고, 2 이상이면 해당 파일에 기록한다. 실제로 쓴 바이트 수를 반환한다
+
+### 테스트가 요구하는 동작
+
+| 테스트 | 전달 값 | 기대 결과 |
+| --- | --- | --- |
+| read-normal | sample.txt 전체 읽기 | 내용이 정확히 일치 |
+| read-zero | size 0 | 0 반환, 버퍼 변경 없음 |
+| read-stdout | fd 1 로 읽기 | 조용한 실패 또는 exit(-1) |
+| read-bad-fd | 0x20101234, 5, 1234, -1, -1024, INT_MIN, INT_MAX | 조용한 실패 또는 exit(-1) |
+| write-normal | 연 파일에 sample 기록 | 요청한 바이트 수와 동일한 반환값 |
+| write-zero | size 0 | 0 반환 |
+| write-stdin | fd 0 으로 쓰기 | 조용한 실패 또는 exit(-1) |
+| write-bad-fd | 잘못된 fd 7종 | 조용한 실패 또는 exit(-1) |
+| multi-child-fd | 자식이 부모의 fd 를 close 시도 | 자식의 close 는 무효, 부모는 계속 사용 가능 |
+
+### III.B 개발 방법
+
+| 구분 | 내용 |
+| --- | --- |
+| 수정 소스코드 | src/userprog/syscall.c |
+| 수정 함수 | read (), write () |
+| 추가 선언 | get_file () 전방 선언 |
+| 사용한 내장 함수 | file_read (), file_write () — filesys/file.c |
+
+변경 내용
+
+- read 의 fd == 0 경로와 write 의 fd == 1 경로는 그대로 두고, 그 아래에 get_file () 로 얻은 struct file \* 을 사용하는 분기를 추가했다
+- 기존의 마지막 `return -1;` 두 줄이 이 분기로 대체되었다. 유효하지 않은 fd 이면 여전히 -1 이 반환된다
+- get_file () 정의가 read, write 보다 아래에 있어 전방 선언을 추가했다. 정의를 위로 옮기면 1-2-3 에서 확인한 배치가 흔들리므로 선언만 앞으로 뺐다
+
+### 설계 판단
+
+- 표준 입출력 분기를 먼저 검사하고 파일 분기를 뒤에 두었다. fd 0 과 1 은 Fd_table 에서 항상 NULL 이므로 순서를 바꾸면 콘솔 입출력이 -1 로 떨어진다
+- 잘못된 fd 에 대해 1-2-3 의 close 와 같은 조용한 실패를 유지했다. read-bad-fd 와 write-bad-fd 는 한 프로세스에서 7번을 연달아 호출하므로, 첫 호출에서 죽이면 나머지 경로를 확인할 수 없다
+- 자식 프로세스가 부모의 fd 를 닫지 못하는 것은 별도 처리 없이 자료구조에서 보장된다. Fd_table 이 스레드마다 따로 있고 exec 이 이를 복제하지 않으므로, 자식의 Fd_table[handle] 은 NULL 이고 close 는 아무 일도 하지 않는다. multi-child-fd 가 요구하는 동작이 곧 1-2-1 의 설계 결과다
+- 실행 파일 쓰기 금지는 여기서 처리하지 않았다. write 안에서 파일 이름을 비교하는 방식은 확장성이 없고, 1-2-6 에서 file_deny_write () 로 파일 쪽에 표시하면 file_write () 가 알아서 0 을 돌려준다
+
+### IV.A Flow Chart 소재
+
+```
+read(fd, buffer, size)
+  ├─ check_address(buffer, size)        ← size 0 이면 즉시 통과
+  ├─ fd == 0 ?  → input_getc() 반복 → size 반환
+  └─ get_file(fd)
+       ├─ NULL → -1                      (fd 1, 범위 밖, 빈 칸)
+       └─ file_read(File, buffer, size) → 읽은 바이트 수
+
+write(fd, buffer, size)
+  ├─ check_address(buffer, size)
+  ├─ fd == 1 ?  → putbuf() → size 반환
+  └─ get_file(fd)
+       ├─ NULL → -1                      (fd 0, 범위 밖, 빈 칸)
+       └─ file_write(File, buffer, size) → 쓴 바이트 수
+```
+
+### 검증 기록
+
+| 항목 | 결과 |
+| --- | --- |
+| 빌드 | 경고 0건 |
+| read-normal, read-zero, read-boundary, read-stdout, read-bad-fd | 5개 모두 pass |
+| write-normal, write-zero, write-boundary, write-stdin, write-bad-fd | 5개 모두 pass |
+| multi-child-fd | pass |
+
+multi-child-fd 통과는 자식이 부모의 fd 를 닫지 못한다는 뜻이며, 1-2-1 에서 테이블을 프로세스별로 둔 설계가 그대로 요구사항을 만족시켰다.
+
+---
+
+## 1-2-5 seek, tell
+
+### II.A 구현 이유와 기대 결과
+
+- 이유 : 지금까지의 read 와 write 는 파일을 앞에서부터 순서대로만 다룬다. 파일의 임의 위치를 지목할 수 있어야 파일 시스템 시스템 콜 13개가 모두 채워진다
+- 기대 결과 : tests/userprog 에는 seek, tell 단독 테스트가 없다. tests/filesys/base 의 sm-random, lg-random 이 임의 순서로 블록을 쓰고 읽으며 seek 를 직접 사용한다
+
+### II.B 시스템 콜 설명
+
+- seek : fd 가 가리키는 파일의 다음 읽기 / 쓰기 위치를 파일 시작에서 position 바이트 지점으로 옮긴다. 반환값이 없다
+- tell : fd 가 가리키는 파일의 현재 위치를 파일 시작으로부터의 바이트 수로 반환한다
+
+### III.B 개발 방법
+
+| 구분 | 내용 |
+| --- | --- |
+| 수정 소스코드 | src/userprog/syscall.c, src/userprog/syscall.h |
+| 추가 함수 | void seek (int fd, unsigned position), unsigned tell (int fd) |
+| 수정 함수 | syscall_handler () |
+| 사용한 내장 함수 | file_seek (), file_tell () — filesys/file.c |
+
+변경 내용
+
+- SYS_SEEK (인자 2개, 반환값 없음), SYS_TELL (인자 1개, f->eax 에 저장) 분기를 추가했다
+- 두 함수 모두 1-2-3 의 get_file () 로 fd 를 검증한다
+
+이로써 Prj1-2 가 요구하는 파일 관련 시스템 콜 9개(create, remove, open, filesize, read, write, seek, tell, close)가 모두 채워졌다.
+
+### 설계 판단
+
+- 위치 정보를 Fd_table 이나 별도 구조체에 따로 두지 않았다. 위치는 struct file 안의 pos 필드가 이미 관리한다. 같은 파일을 두 번 열면 struct file 이 두 개 생기므로 위치도 자연스럽게 분리되며, 이것이 open-twice 가 요구하는 독립성과 같은 성질이다
+- 파일 끝을 넘어선 seek 을 오류로 막지 않았다. 매뉴얼은 이를 정상 동작으로 규정하고, 그 자리에서 읽으면 0 바이트가 반환된다. 시스템 콜 계층에서 범위를 제한하면 매뉴얼과 어긋난다
+- tell 이 실패할 때 -1 을 반환하도록 했다. 반환형이 unsigned 라 0xffffffff 로 전달되지만, 매뉴얼이 실패 시 반환값을 규정하지 않는 이상 다른 시스템 콜과 같은 실패 표시를 쓰는 편이 일관적이다. 파일 크기가 0xffffffff 에 이를 일은 없다
+- seek 은 잘못된 fd 에 대해 조용히 무시한다. 1-2-3 의 close, 1-2-4 의 read / write 와 같은 규칙이며, 실패 처리 방식이 시스템 콜마다 달라지지 않도록 맞췄다
+
+### IV.A Flow Chart 소재
+
+```
+seek(fd, position)
+  └─ get_file(fd)
+       ├─ NULL → 조용히 반환
+       └─ file_seek(File, position)   → struct file 의 pos 갱신
+
+tell(fd)
+  └─ get_file(fd)
+       ├─ NULL → -1
+       └─ file_tell(File)             → 현재 pos 반환
+```
+
+### 검증 기록
+
+| 항목 | 결과 |
+| --- | --- |
+| 빌드 | 우리 코드에서 경고 0건 |
+| tests/filesys/base : sm-create, sm-full, sm-random, sm-seq-block, sm-seq-random | 5개 모두 pass |
+
+sm-random 과 sm-seq-random 은 블록을 무작위 순서로 seek 해가며 쓴 뒤 다시 읽어 내용을 대조한다. 통과했다는 것은 위치 이동이 정확히 반영된다는 뜻이다.
+
+---
+
+## 1-2-6 실행 파일 쓰기 금지 (Denying Writes to Executables)
+
+### II.A 구현 이유와 기대 결과
+
+- 이유 : 프로세스가 도는 동안 그 실행 파일이 수정되면, 아직 적재하지 않은 부분을 읽을 때 내용이 뒤바뀌어 있을 수 있다. 매뉴얼과 조교 슬라이드 72 는 실행 중인 파일에 대한 쓰기를 커널이 막도록 요구한다
+- 기대 결과 : rox-simple, rox-child, rox-multichild 3개 통과
+
+### II.B 구현 방식
+
+Pintos 는 이 목적을 위한 API 를 이미 제공한다.
+
+| 함수 | 동작 |
+| --- | --- |
+| file_deny_write (struct file \*) | 해당 inode 의 deny_write_cnt 를 올린다. 이후 그 inode 에 대한 쓰기는 0 바이트만 기록된다 |
+| file_allow_write (struct file \*) | 카운트를 되돌린다. file_close () 가 내부에서 호출한다 |
+
+핵심은 **파일을 닫으면 금지가 풀린다**는 점이다. 따라서 실행 파일을 열어 둔 채로 프로세스가 끝날 때까지 붙잡고 있어야 한다.
+
+### 테스트가 요구하는 동작
+
+| 테스트 | 상황 | 기대 결과 |
+| --- | --- | --- |
+| rox-simple | 자기 실행 파일을 열어 쓰기 시도 | write 가 0 반환 |
+| rox-child | 자식이 부모의 실행 파일에 쓰기 시도 | write 가 0 반환 |
+| rox-multichild | 여러 단계의 자식이 같은 시도 | 모두 0 반환 |
+
+금지 상태가 inode 단위로 걸리기 때문에, 다른 프로세스가 같은 파일을 새로 열어 얻은 fd 로 써도 막힌다. rox-child 와 rox-multichild 가 이 성질을 확인한다.
+
+### III.B 개발 방법
+
+| 구분 | 내용 |
+| --- | --- |
+| 수정 소스코드 | src/threads/thread.h, src/threads/thread.c, src/userprog/process.c |
+| 추가 자료구조 | struct thread 의 `struct file *Exec_file` |
+| 수정 함수 | init_thread (), load (), process_exit () |
+| 사용한 내장 함수 | file_deny_write (), file_close () — filesys/file.c |
+
+변경 내용
+
+1. thread.h : 실행 중인 파일을 붙잡아 둘 `Exec_file` 필드를 추가했다
+2. thread.c : `init_thread ()` 에서 NULL 로 초기화한다
+3. process.c
+   - `load ()` : 실행 파일을 연 직후 `file_deny_write ()` 를 부르고 `Exec_file` 에 보관한다
+   - `load ()` 의 done 라벨 : 무조건 부르던 `file_close ()` 를 적재 실패 시에만 부르도록 바꾸고, 그때 `Exec_file` 도 NULL 로 되돌린다
+   - `process_exit ()` : `Exec_file` 이 있으면 닫는다
+
+### 설계 판단
+
+- 쓰기 금지를 write 시스템 콜 쪽에서 처리하지 않았다. 실행 파일 이름을 비교하거나 fd 를 검사하는 방식은 같은 파일을 다른 이름으로 열면 뚫리고, 자식 프로세스가 부모의 실행 파일에 쓰는 rox-child 를 막지 못한다. inode 단위로 표시하는 Pintos 의 기존 장치를 쓰면 두 경우가 한 번에 해결된다
+- done 라벨의 `file_close ()` 를 실패 경로로 한정한 것이 이 단계의 핵심이다. 이 한 줄을 그대로 두면 방금 건 금지가 즉시 풀려 rox 계열이 전부 깨진다. 반대로 조건 없이 지우면 적재에 실패한 파일이 닫히지 않아 누수가 된다
+- 실패 시 `Exec_file` 을 NULL 로 되돌린다. 여기서 닫고 필드에도 남겨 두면 `process_exit ()` 이 같은 포인터를 한 번 더 닫아 이중 해제가 된다
+- 파일을 닫는 책임을 `process_exit ()` 에 모았다. 1-2-1 의 Fd_table 반납, 1-1-5 의 종료 메시지 출력과 같은 자리이며, 정상 종료와 page fault 강제 종료가 모두 이 함수를 지난다
+- `file_allow_write ()` 를 직접 부르지 않는다. `file_close ()` 가 내부에서 호출하므로 중복해서 부르면 카운트가 어긋난다
+
+### IV.A Flow Chart 소재
+
+```
+load()
+  ├─ filesys_open(Prog_name)
+  ├─ file_deny_write(file)              ← inode 의 deny_write_cnt 증가
+  ├─ Exec_file = file                    ← 프로세스가 끝날 때까지 붙잡음
+  ├─ ... ELF 헤더 검증, 세그먼트 적재, 스택 구성 ...
+  └─ done:
+       └─ 실패한 경우에만 Exec_file = NULL, file_close(file)
+
+다른 프로세스의 write(fd, ...)
+  └─ file_write() → inode_write_at()
+       └─ deny_write_cnt > 0 이면 0 바이트 반환
+
+process_exit()
+  ├─ 자식들의 Destroy_sema 해제           (1-1-7)
+  ├─ 열린 파일 정리, Fd_table 반납         (1-2-1)
+  ├─ file_close(Exec_file)                (1-2-6) → file_allow_write() 자동 호출
+  └─ "이름: exit(상태)" 출력               (1-1-5)
+```
+
+### 검증 기록
+
+| 항목 | 결과 |
+| --- | --- |
+| 빌드 | 우리 코드에서 경고 0건 |
+| rox-simple, rox-child, rox-multichild | 3개 모두 pass |
+| 회귀 확인 : multi-recurse, multi-child-fd | 2개 모두 pass |
+
+실행 파일을 프로세스 종료까지 붙잡는 구조로 바뀌면서 파일 해제 경로가 달라졌으므로 회귀 항목을 함께 돌렸다. 이중 해제나 누수로 인한 패닉은 발생하지 않았다.
+
+---
+
+## 1-2-7 파일 시스템 동기화
+
+### II.A 구현 이유와 기대 결과
+
+- 이유 : Pintos 의 기본 파일 시스템에는 내부 동기화가 전혀 없다(매뉴얼 3.1.2). 여러 프로세스가 동시에 파일을 만들거나 읽고 쓰면 free map, 디렉터리, inode 가 중간 상태에서 갱신되어 깨진다. 지금까지 구현한 시스템 콜은 모두 이 계층을 직접 부른다
+- 기대 결과 : tests/filesys/base 의 syn-read, syn-write, syn-remove 통과. 기존 통과 항목은 그대로 유지
+
+### II.B 동기화 방식
+
+전역 락 하나(`Filesys_lock`)로 파일 시스템 계층 진입을 직렬화한다. 실체는 syscall.c 에 두고 `syscall_init ()` 에서 초기화하며, process.c 에서도 쓸 수 있도록 syscall.h 에 extern 으로 공개한다.
+
+락으로 감싼 구간
+
+| 위치 | 감싼 호출 |
+| --- | --- |
+| create, remove | filesys_create (), filesys_remove () |
+| open | filesys_open (), 테이블이 가득 찼을 때의 file_close () |
+| read, write | file_read (), file_write () |
+| filesize, seek, tell, close | file_length (), file_seek (), file_tell (), file_close () |
+| load () | 함수 전체 (filesys_open () 과 세그먼트 적재의 file_read ()) |
+| process_exit () | 열린 파일 닫기 반복문, 실행 파일 닫기 |
+
+감싸지 않은 구간
+
+| 위치 | 이유 |
+| --- | --- |
+| check_address (), check_string () | 검증 실패 시 exit(-1) 로 빠져나간다. 락을 쥔 채 나가면 아무도 풀 수 없다 |
+| read 의 fd == 0, write 의 fd == 1 | 파일 시스템과 무관하다. 특히 input_getc () 는 입력을 기다리는 blocking 호출이라, 감싸면 그동안 모든 프로세스의 파일 접근이 멈춘다 |
+| Fd_table 탐색과 페이지 반납 | 프로세스마다 따로 있는 자료라 경쟁이 없다 |
+
+### III.B 개발 방법
+
+| 구분 | 내용 |
+| --- | --- |
+| 수정 소스코드 | src/userprog/syscall.c, src/userprog/syscall.h, src/userprog/process.c |
+| 추가 자료구조 | struct lock Filesys_lock (전역) |
+| 수정 함수 | syscall_init (), create (), remove (), open (), read (), write (), filesize (), seek (), tell (), close (), load (), process_exit () |
+| 추가 include | userprog/syscall.h (process.c 에서) |
+| 사용한 내장 함수 | lock_init (), lock_acquire (), lock_release () — threads/synch.c |
+
+### 설계 판단
+
+- 락을 파일마다 두지 않고 전역 하나로 했다. Pintos 의 기본 파일 시스템은 파일 하나를 건드릴 때도 free map 과 디렉터리라는 공유 자료를 함께 수정하므로, 파일 단위로 쪼개도 그 공유 부분은 결국 다시 보호해야 한다. Project 3 에서 파일 시스템 자체를 개선할 때 잘게 나누는 것이 순서다
+- 락 획득 지점을 사용자 포인터 검증 뒤로 두었다. 이 순서가 뒤바뀌면 잘못된 포인터를 넘긴 프로세스가 락을 쥔 채 exit(-1) 로 죽고, 그 뒤로 어떤 프로세스도 파일에 접근하지 못해 시스템 전체가 멈춘다. 시스템 콜 구현에서 가장 조심한 부분이다
+- load () 는 함수 전체를 감쌌다. 시스템 콜 쪽만 잠그면 exec 로 프로세스가 뜨는 도중의 파일 접근이 보호되지 않는다. 첫 `goto done` 보다 앞에서 락을 잡아, 잡지 않은 락을 푸는 경우가 생기지 않게 했다
+- load () 가 실패하면 done 에서 락을 먼저 풀고 반환한다. 실패 시 start_process () 가 thread_exit () 을 부르고 그 안의 process_exit () 이 같은 락을 다시 잡으므로, 풀지 않고 나가면 자기 자신을 기다리는 교착이 된다
+- read 의 키보드 입력 경로를 락 밖에 둔 것도 같은 성격의 판단이다. blocking 호출을 락 안에 넣으면 한 프로세스가 키 입력을 기다리는 동안 나머지 전부가 멈춘다
+
+### IV.A Flow Chart 소재
+
+```
+시스템 콜 진입
+  ├─ check_address / check_string        ← 락 밖 (실패 시 exit(-1))
+  ├─ get_file(fd)                         ← 락 밖 (프로세스 자신의 테이블)
+  ├─ lock_acquire(&Filesys_lock)
+  │    └─ filesys_* / file_* 호출          ← 임계 구역
+  ├─ lock_release(&Filesys_lock)
+  └─ 결과를 f->eax 로 반환
+
+exec 경로
+  start_process() → load()
+    ├─ lock_acquire(&Filesys_lock)        ← 첫 goto done 보다 앞
+    ├─ filesys_open, file_read, file_deny_write
+    └─ done: (실패면 file_close) → lock_release → 반환
+```
+
+### 검증 기록
+
+| 항목 | 결과 |
+| --- | --- |
+| 빌드 | 우리 코드에서 경고 0건 |
+| tests/filesys/base : syn-read, syn-write, syn-remove | 3개 모두 pass |
+| 회귀 확인 : multi-recurse, multi-child-fd, rox-child | 3개 모두 pass |
+
+syn-read 는 자식 10개가 같은 파일을 동시에 읽는다. 타임아웃 없이 통과했으므로 교착이 없고, 내용 대조도 통과했으므로 감싸지 못한 임계 구역이 남아 있지 않다. rox-child 통과는 exec 경로에 락을 넣고도 적재가 정상임을 보여 준다.
+
+---
+
+## 1-2-8 전체 회귀 검증
+
+### 최종 결과
+
+```
+TOTAL TESTING SCORE: 100.0%
+ALL TESTED PASSED -- PERFECT SCORE
+```
+
+| 테스트 세트 | 점수 | 비중 |
+| --- | --- | --- |
+| tests/userprog/Rubric.functionality | 108 / 108 | 35.0% / 35.0% |
+| tests/userprog/Rubric.robustness | 88 / 88 | 25.0% / 25.0% |
+| tests/userprog/no-vm/Rubric | 1 / 1 | 10.0% / 10.0% |
+| tests/filesys/base/Rubric | 30 / 30 | 30.0% / 30.0% |
+| **합계** | **76 / 76 항목** | **100.0%** |
+
+1-1-9 시점의 41.3% 에서 100.0% 로 올라갔다. 늘어난 58.7%p 는 전부 Prj1-2 범위(파일 시스템 콜, 실행 파일 보호, 동기화)에서 나왔다.
+
+### 추가 구현 확인
+
+```
+Executing 'additional 10 20 62 40':
+55 62
+additional: exit(0)
+Exception: 0 page faults
+```
+
+fibonacci (10) = 55, max_of_four_int (10, 20, 62, 40) = 62 로 슬라이드 55 의 예시와 일치한다.
+
+### 단계별 검증 이력
+
+| 단계 | 내용 | 검증 대상 | 결과 |
+| --- | --- | --- | --- |
+| 1-2-1 | File Descriptor 자료구조 | echo, multi-recurse | 통과 |
+| 1-2-2 | create, remove | create 계열 7개 | 통과 |
+| 1-2-3 | open, close, filesize | open / close 계열 12개 | 통과 |
+| 1-2-4 | fd 기반 read, write | read / write 계열 10개, multi-child-fd | 통과 |
+| 1-2-5 | seek, tell | filesys/base sm 계열 5개 | 통과 |
+| 1-2-6 | 실행 파일 쓰기 금지 | rox 3개 + 회귀 2개 | 통과 |
+| 1-2-7 | 파일 시스템 동기화 | syn 계열 3개 + 회귀 3개 | 통과 |
+| 1-2-8 | 전체 회귀 | 76개 전체 | 100.0% |
+
+### 눈여겨볼 결과
+
+- **multi-oom (no-vm) 통과** : 1-2-1 에서 프로세스마다 파일 디스크립터 테이블용으로 4 kB 페이지를 하나씩 더 쓰기로 했기 때문에, 메모리를 고갈시키는 이 테스트가 가장 걱정되는 항목이었다. 통과했다는 것은 페이지 한 장의 추가 비용이 요구 재귀 깊이에 영향을 주지 않았고, 종료 시 반납도 빠짐없이 이루어졌다는 뜻이다
+- **lg 계열 전부 통과** : 큰 파일에 대한 임의 접근(lg-random, lg-seq-random)까지 통과해 seek 구현이 파일 크기와 무관하게 동작함을 확인했다
+- **경고 2건 유지** : `threads/init.c` 의 noreturn 반환 경로와 `lib/kernel/debug.c:82` 의 `__builtin_frame_address (1)` 로, 둘 다 배포본 원본이며 이번 프로젝트에서 손대지 않았다
+
+### IV.B 개발 과정에서 조심한 지점 (종합)
+
+1. **fd 배정에 카운터를 쓰지 않았다** — close 로 비운 칸을 재사용하지 못해 fd 가 고갈되는 문제를 피했다
+2. **close 후 테이블 칸을 NULL 로 되돌린다** — 두 번째 close 가 해제된 포인터를 다시 넘기는 것을 막는다 (close-twice)
+3. **load () 의 done 라벨에서 file_close () 를 실패 시로 한정** — file_close () 가 내부에서 file_allow_write () 를 부르므로, 조건 없이 두면 실행 파일 쓰기 금지가 즉시 풀린다 (rox 계열)
+4. **락은 사용자 포인터 검증을 마친 뒤에 잡는다** — 검증 실패는 exit(-1) 로 빠져나가므로, 락을 쥔 채 죽으면 시스템 전체가 멈춘다
+5. **load () 는 done 에서 락을 풀고 반환한다** — 적재 실패 시 process_exit () 이 같은 락을 다시 잡으므로, 풀지 않으면 자기 자신을 기다리는 교착이 된다
+6. **blocking 호출은 임계 구역 밖에 둔다** — input_getc () 를 락 안에 넣으면 한 프로세스가 키 입력을 기다리는 동안 나머지 전부가 멈춘다

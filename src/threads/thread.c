@@ -490,6 +490,26 @@ init_thread (struct thread *t, const char *name, int priority)
   sema_init (&t->Load_sema, 0);
   sema_init (&t->Exit_sema, 0);
   sema_init (&t->Destroy_sema, 0);
+
+  /* [1-2-1] File Descriptor : 파일 디스크립터 테이블 포인터 초기화
+     목적 : 아직 테이블을 갖지 않은 상태임을 NULL 로 명시한다
+     참고 : threads/thread.h 의 struct file **Fd_table
+            proj1 슬라이드 69 - 각 스레드가 독립적인 파일 디스크립터를 관리한다
+     주의 : 위 memset() 이 이미 0 으로 채우지만, 바로 위 1-1-7 필드들과 같은
+            이유로 초기화 의도를 코드에 남긴다
+            실제 페이지 할당은 사용자 프로세스에만 필요하므로 여기서 하지 않고
+            start_process() 에서 palloc_get_page (PAL_ZERO) 로 수행한다
+            커널 스레드는 이 값이 NULL 인 채로 유지되며,
+            시스템 콜 구현부는 NULL 검사로 두 경우를 구분한다 */
+  t->Fd_table = NULL;
+
+  /* [1-2-6] Denying Writes to Executables : 실행 파일 포인터 초기화
+     목적 : 아직 실행 파일을 붙잡지 않은 상태임을 NULL 로 명시한다
+     참고 : threads/thread.h 의 struct file *Exec_file
+     주의 : 실제 값은 load () 가 실행 파일을 연 뒤에 채운다
+            커널 스레드와 적재에 실패한 프로세스는 NULL 인 채로 남고,
+            process_exit () 은 NULL 이면 아무 일도 하지 않는다 */
+  t->Exec_file = NULL;
 #endif
 
   old_level = intr_disable ();

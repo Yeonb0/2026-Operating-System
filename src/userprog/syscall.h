@@ -50,4 +50,43 @@ int wait (tid_t tid);
 int fibonacci (int n);
 int max_of_four_int (int a, int b, int c, int d);
 
+/* [1-2-2] 시스템 콜 프로토타입 : create, remove
+   목적 : switch 분기에서 호출할 파일 생성 / 삭제 구현의 선언
+   참고 : Pintos manual 3.3.4 create, remove
+          proj1 슬라이드 71 - filesys/filesys.h 의 API 를 사용한다
+   주의 : bool 은 위에서 포함한 threads/thread.h 가 <stdbool.h> 를 들여오므로
+          별도 포함이 필요 없다
+          lib/user/syscall.h 에도 같은 이름의 선언이 있지만 그쪽은
+          사용자 프로그램 전용이라 커널 빌드에는 포함되지 않는다 */
+bool create (const char *file, unsigned initial_size);
+bool remove (const char *file);
+
+/* [1-2-3] 시스템 콜 프로토타입 : open, filesize, close
+   목적 : 파일 디스크립터를 배정하고 조회하고 반납하는 구현의 선언
+   참고 : Pintos manual 3.3.4 open / filesize / close, proj1 슬라이드 69, 71
+   주의 : fd 를 struct file * 로 바꾸는 get_file () 은 static 이라
+          여기에 선언하지 않는다
+          close 는 반환값이 없으므로 switch 에서 f->eax 를 건드리지 않는다 */
+int open (const char *file);
+int filesize (int fd);
+void close (int fd);
+
+/* [1-2-5] 시스템 콜 프로토타입 : seek, tell
+   목적 : 파일 내 임의 위치 접근을 처리하는 구현의 선언
+   참고 : Pintos manual 3.3.4 seek / tell, proj1 슬라이드 71
+   주의 : tell 의 반환형은 매뉴얼 표기대로 unsigned 다
+          seek 은 반환값이 없으므로 switch 에서 f->eax 를 건드리지 않는다 */
+void seek (int fd, unsigned position);
+unsigned tell (int fd);
+
+/* [1-2-7] 파일 시스템 동기화 : 전역 락 선언
+   목적 : userprog/process.c 의 load () 와 process_exit () 도 같은 락으로
+          파일 시스템 접근을 직렬화할 수 있게 공개한다
+   참고 : Pintos manual 3.1.2 - 기본 파일 시스템에는 내부 동기화가 없다
+   주의 : 실체는 userprog/syscall.c 에 있고 syscall_init () 에서 초기화된다
+          struct lock 은 threads/thread.h 가 들여오는 threads/synch.h 에 있다
+          락을 쥔 채로 exit(-1) 경로에 들어가면 시스템이 멈추므로,
+          사용자 포인터 검증은 반드시 락 밖에서 끝내야 한다 */
+extern struct lock Filesys_lock;
+
 #endif /* userprog/syscall.h */
