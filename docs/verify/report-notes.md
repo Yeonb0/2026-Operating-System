@@ -457,3 +457,43 @@ pass tests/userprog/wait-killed
 ## 남은 임시 코드
 
 - 없음 (process_wait () 의 임시 대기 루프는 1-1-7 에서 제거됨)
+
+## 1-1-8 Additional System Calls (fibonacci, max_of_four_int)
+
+보고서 대응 항목 : IV.F Additional System calls, V.A 시험 및 평가 내용
+근거 : proj1 슬라이드 54 - 58, 82 / Pintos manual 3.2, 3.5
+
+### 수정하거나 추가한 파일
+
+| 파일 | 내용 |
+| --- | --- |
+| src/lib/syscall-nr.h | enum 끝에 SYS_FIBONACCI(20), SYS_MAX_OF_FOUR_INT(21) 추가 |
+| src/lib/user/syscall.h | 사용자 API 프로토타입 2개 추가 |
+| src/lib/user/syscall.c | syscall4 매크로 정의, fibonacci / max_of_four_int API 정의 |
+| src/userprog/syscall.h | 커널 측 구현 프로토타입 2개 추가 |
+| src/userprog/syscall.c | 두 함수 구현, Arg[3] → Arg[4], switch 분기 2개 추가 |
+| src/examples/additional.c | 신규 사용자 프로그램 |
+| src/examples/Makefile | PROGS 와 additional_SRC 에 등록 |
+
+### 설계상 판단한 것
+
+1. 시스템 콜 번호는 enum 의 맨 끝에 붙였다. 중간에 삽입하면 기존 번호가 전부
+   밀려 이미 통과한 21개 테스트가 한꺼번에 깨지기 때문이다.
+2. max_of_four_int 는 인자가 4개인데 배포본에는 syscall3 까지만 있어 syscall4 를
+   새로 정의했다. 인자 제약은 syscall2, syscall3 과 같은 "r"(레지스터)를 썼다.
+   syscall1 처럼 "g" 를 쓰면 인자가 esp 기준 메모리 피연산자로 잡힐 수 있는데,
+   앞선 push 로 esp 가 이미 이동한 상태라 잘못된 위치를 읽게 된다.
+   정리할 스택 크기는 인자 4개 + 번호 1개 = 20바이트다.
+3. syscall_handler 의 인자 배열을 Arg[3] 에서 Arg[4] 로 넓혔다. Arg[3] 인 채로
+   get_argument(f->esp, Arg, 4) 를 호출하면 커널 스택 범위를 넘겨 쓰게 된다.
+4. fibonacci 는 재귀가 아닌 반복문으로 구현했다. 커널 스택 깊이와 실행 시간을
+   함께 줄이기 위해서다. F(1) = 1, F(2) = 1 기준이어야 fibonacci(10) 이 55 가 된다.
+5. 계산 자체는 커널의 userprog/syscall.c 에서 수행한다. 사용자 라이브러리는
+   int $0x30 으로 요청을 넘기는 역할만 한다. 그래야 시스템 콜을 구현한 것이 된다.
+
+### 사용자 레벨 호출부터 복귀까지의 흐름 (보고서 III.B 재사용 가능)
+
+additional.c 의 max_of_four_int(a, b, c, d)
+  → lib/user/syscall.c 의 syscall4 : 인자 4개와 번호를 역순으로 push 후 int $0x30
+  → 0x30 인터럽트 → userprog/syscall.c 의 syscall_handler()
+  →

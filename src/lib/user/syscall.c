@@ -61,8 +61,37 @@
           retval;                                               \
         })
 
+/* [1-1-8] 인자 4개짜리 시스템 콜 호출 매크로
+   목적 : max_of_four_int 처럼 인자가 4개인 시스템 콜을 호출한다
+   입력 : NUMBER - lib/syscall-nr.h 의 시스템 콜 번호
+          ARG0 ~ ARG3 - 4바이트 인자 4개
+   출력 : 커널이 f->eax 에 넣어 준 값이 retval 로 나온다
+   참고 : proj1 슬라이드 58 - max_of_four_int 를 위해 syscall4() 를 정의하라는 안내
+          Pintos manual 3.5 80x86 Calling Convention
+   주의 : 인자를 역순으로 push 해야 커널에서 esp + 4 부터 순서대로 읽힌다
+          정리할 스택 크기는 인자 4개와 번호 1개를 합쳐 20바이트다
+          인자 제약은 syscall2, syscall3 과 같이 "r" 를 쓴다
+          "g" 를 쓰면 인자가 esp 기준 메모리 피연산자로 잡힐 수 있는데,
+          앞선 push 로 esp 가 이미 움직여 엉뚱한 위치를 읽게 된다 */
+#define syscall4(NUMBER, ARG0, ARG1, ARG2, ARG3)                \
+        ({                                                      \
+          int retval;                                           \
+          asm volatile                                          \
+            ("pushl %[arg3]; pushl %[arg2]; "                   \
+             "pushl %[arg1]; pushl %[arg0]; "                   \
+             "pushl %[number]; int $0x30; addl $20, %%esp"      \
+               : "=a" (retval)                                  \
+               : [number] "i" (NUMBER),                         \
+                 [arg0] "r" (ARG0),                             \
+                 [arg1] "r" (ARG1),                             \
+                 [arg2] "r" (ARG2),                             \
+                 [arg3] "r" (ARG3)                              \
+               : "memory");                                     \
+          retval;                                               \
+        })
+
 void
-halt (void) 
+halt (void)
 {
   syscall0 (SYS_HALT);
   NOT_REACHED ();
@@ -181,4 +210,29 @@ int
 inumber (int fd) 
 {
   return syscall1 (SYS_INUMBER, fd);
+}
+
+/* [1-1-8] fibonacci 사용자 API
+   목적 : 사용자 프로그램의 fibonacci () 호출을 시스템 콜로 넘긴다
+   입력 : n - 몇 번째 항인지
+   출력 : 커널이 계산한 n 번째 피보나치 수
+   참고 : proj1 슬라이드 54, 58
+   주의 : 계산은 여기서 하지 않는다
+          커널에서 계산해야 시스템 콜을 구현한 것이 된다 */
+int
+fibonacci (int n)
+{
+  return syscall1 (SYS_FIBONACCI, n);
+}
+
+/* [1-1-8] max_of_four_int 사용자 API
+   목적 : 정수 4개를 커널로 넘겨 최댓값을 받아 온다
+   입력 : a, b, c, d - 비교할 정수 4개
+   출력 : 네 값 중 최댓값
+   참고 : proj1 슬라이드 54, 58
+   주의 : 인자가 4개이므로 위에서 정의한 syscall4 를 쓴다 */
+int
+max_of_four_int (int a, int b, int c, int d)
+{
+  return syscall4 (SYS_MAX_OF_FOUR_INT, a, b, c, d);
 }

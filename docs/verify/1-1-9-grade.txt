@@ -1,0 +1,40 @@
+warning: test tests/userprog/exec-bound-3 doesn't count for grading
+warning: test tests/userprog/exec-bound-2 doesn't count for grading
+warning: test tests/userprog/sc-boundary-3 doesn't count for grading
+warning: test tests/userprog/exec-bound doesn't count for grading
+TOTAL TESTING SCORE: 41.3%
+
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+
+SUMMARY BY TEST SET
+
+Test Set                                      Pts Max  % Ttl  % Max
+--------------------------------------------- --- --- ------ ------
+tests/userprog/Rubric.functionality            66/108  21.4%/ 35.0%
+tests/userprog/Rubric.robustness               70/ 88  19.9%/ 25.0%
+tests/userprog/no-vm/Rubric                     0/  1   0.0%/ 10.0%
+tests/filesys/base/Rubric                       0/ 30   0.0%/ 30.0%
+--------------------------------------------- --- --- ------ ------
+Total                                                  41.3%/100.0%
+
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+
+SUMMARY OF INDIVIDUAL TESTS
+
+Functionality of system calls (tests/userprog/Rubric.functionality):
+	- Test argument passing on Pintos command line.
+	     3/ 3 tests/userprog/args-none
+	     3/ 3 tests/userprog/args-single
+	     3/ 3 tests/userprog/args-multiple
+	     3/ 3 tests/userprog/args-many
+	     3/ 3 tests/userprog/args-dbl-space
+
+	- Test "create" system call.
+	     3/ 3 tests/userprog/create-empty
+	  ** 0/ 3 tests/userprog/create-long
+	  ** 0/ 3 tests/userprog/create-normal
+	  ** 0/ 3 tests/userprog/create-exists
+
+	- Test "open" system call.
+	  ** 0/ 3 tests/userprog/open-missing
+	  ** 0/ 3 tests/userprog/open-normal

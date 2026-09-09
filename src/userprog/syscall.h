@@ -41,4 +41,13 @@ int write (int fd, const void *buffer, unsigned size);
 tid_t exec (const char *cmd_line);
 int wait (tid_t tid);
 
+/* [1-1-8] 시스템 콜 프로토타입 : fibonacci, max_of_four_int
+   목적 : 추가 시스템 콜의 커널 측 구현을 switch 분기에서 호출하기 위한 선언
+   참고 : proj1 슬라이드 54, 58 - userprog/syscall.h 에 프로토타입 작성
+   주의 : lib/user/syscall.h 에도 같은 이름의 선언이 있지만 그쪽은
+          사용자 프로그램 전용이라 커널 빌드에는 포함되지 않는다
+          read, write, exit 도 이미 같은 구조이므로 충돌하지 않는다 */
+int fibonacci (int n);
+int max_of_four_int (int a, int b, int c, int d);
+
 #endif /* userprog/syscall.h */

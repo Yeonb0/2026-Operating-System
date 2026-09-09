@@ -249,6 +249,62 @@ wait (tid_t tid)
   return process_wait (tid);
 }
 
+/* [1-1-8] fibonacci 시스템 콜 : n 번째 피보나치 수 계산
+   목적 : 사용자 프로그램이 요청한 n 번째 피보나치 수를 커널에서 계산해 돌려준다
+   입력 : n - 몇 번째 항인지를 나타내는 정수
+   출력 : n 번째 피보나치 수, n 이 0 이하이면 0
+   참고 : proj1 슬라이드 54 - Return N th value of Fibonacci sequence
+          슬라이드 55 의 예시에서 fibonacci (10) 은 55 다
+   주의 : F(1) = 1, F(2) = 1 기준이어야 fibonacci (10) 이 55 가 된다
+          재귀로 구현하면 커널 스택이 깊어지고 n 이 조금만 커져도 매우 느려지므로
+          반복문으로 계산한다
+          n 이 46 이상이면 int 범위를 넘어 값이 깨지지만, 과제 명세에
+          범위 제한이 없으므로 별도 처리는 두지 않는다
+          n 이 0 이하일 때 반복문이 돌지 않고 0 을 반환하도록 먼저 걸러 낸다 */
+int
+fibonacci (int n)
+{
+  int prev = 0;
+  int cur = 1;
+  int next;
+  int i;
+
+  if (n <= 0)
+    return 0;
+
+  for (i = 1; i < n; i++)
+    {
+      next = prev + cur;
+      prev = cur;
+      cur = next;
+    }
+
+  return cur;
+}
+
+/* [1-1-8] max_of_four_int 시스템 콜 : 네 정수 중 최댓값
+   목적 : 사용자 프로그램이 넘긴 정수 4개 중 가장 큰 값을 돌려준다
+   입력 : a, b, c, d - 비교할 정수 4개
+   출력 : 네 값 중 최댓값
+   참고 : proj1 슬라이드 54 - Return the maximum of a, b, c and d
+          슬라이드 55 의 예시에서 max_of_four_int (10, 20, 62, 40) 은 62 다
+   주의 : 인자가 모두 값 전달이므로 포인터 검증은 필요 없다
+          인자를 꺼내는 쪽(syscall_handler)에서 이미 주소를 검증했다 */
+int
+max_of_four_int (int a, int b, int c, int d)
+{
+  int max = a;
+
+  if (b > max)
+    max = b;
+  if (c > max)
+    max = c;
+  if (d > max)
+    max = d;
+
+  return max;
+}
+
 /* [1-1-3] 수정 : 시스템 콜 진입 시 스택 포인터부터 검증
    변경 내용 : 기존 골격 앞에 check_address() 호출을 추가해
               f->esp 가 가리키는 4바이트(시스템 콜 번호)의 유효성을 먼저 확인
@@ -283,11 +339,21 @@ wait (tid_t tid)
    변경 내용 : 두 case 에서 각각 exec() 과 wait() 을 호출하고 반환값을 f->eax 에 담는다
    변경 이유 : 이제 Prj1-1 범위의 시스템 콜이 모두 채워졌다
    영향 범위 : default 로 떨어지는 것은 Prj1-2 에서 구현할 파일 관련 시스템 콜뿐이다 */
+
+/* [1-1-8] 수정 : 인자 배열 확장과 추가 시스템 콜 분기 구현
+   변경 내용 : Arg 배열 크기를 3 에서 4 로 늘리고,
+              SYS_FIBONACCI 와 SYS_MAX_OF_FOUR_INT 두 case 를 추가한다
+   변경 이유 : max_of_four_int 는 인자가 4개라 기존 Arg[3] 으로는 담을 수 없다
+              Arg[3] 인 상태로 get_argument (f->esp, Arg, 4) 를 부르면
+              커널 스택을 넘어서 써 버리는 심각한 버그가 된다
+   영향 범위 : 배열이 4바이트 커지는 것 외에 기존 case 의 동작은 그대로다
+   참고 : proj1 슬라이드 56 - 시스템 콜 번호는 lib/syscall-nr.h 참고,
+          반환값은 struct intr_frame 의 eax 로 돌려준다 */
 static void
 syscall_handler (struct intr_frame *f) 
 {
   int syscall_number;
-  int Arg[3];
+  int Arg[4];
 
   check_address (f->esp, sizeof (int));
   syscall_number = * (int *) f->esp;
@@ -321,6 +387,16 @@ syscall_handler (struct intr_frame *f)
     case SYS_WAIT:
       get_argument (f->esp, Arg, 1);
       f->eax = wait ((tid_t) Arg[0]);
+      break;
+
+    case SYS_FIBONACCI:
+      get_argument (f->esp, Arg, 1);
+      f->eax = fibonacci (Arg[0]);
+      break;
+
+    case SYS_MAX_OF_FOUR_INT:
+      get_argument (f->esp, Arg, 4);
+      f->eax = max_of_four_int (Arg[0], Arg[1], Arg[2], Arg[3]);
       break;
 
     default:
