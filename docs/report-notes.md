@@ -496,4 +496,80 @@ pass tests/userprog/wait-killed
 additional.c 의 max_of_four_int(a, b, c, d)
   → lib/user/syscall.c 의 syscall4 : 인자 4개와 번호를 역순으로 push 후 int $0x30
   → 0x30 인터럽트 → userprog/syscall.c 의 syscall_handler()
-  →
+  → check_address() 로 esp 검증 → 번호 판별 → get_argument(f->esp, Arg, 4)
+  → max_of_four_int() 계산 → 결과를 f->eax 에 저장
+  → 인터럽트 복귀 시 eax 가 반환값이 되어 사용자 프로그램으로 전달
+
+### IV.D 시험 및 평가 — 추가 시스템 콜
+
+명령
+
+```
+pintos --filesys-size=2 -p ../examples/additional -a additional \
+  -- -f -q run 'additional 10 20 62 40'
+```
+
+출력
+
+```
+55 62
+additional: exit(0)
+Exception: 0 page faults
+```
+
+55 는 열 번째 피보나치 수, 62 는 네 정수 중 최댓값이며 슬라이드 55 의 기대 출력과 일치한다. page fault 가 0 인 것으로 Arg 배열을 4칸으로 넓힌 뒤에도 커널 스택을 침범하지 않았음을 확인했다.
+
+회귀 확인 : echo x 정상 동작 (echo: exit(0)). 시스템 콜 번호를 enum 끝에 추가한 방식이 기존 분기에 영향을 주지 않았다.
+
+증거 파일 : docs/verify/1-1-8-additional.png
+
+---
+
+## 1-1-9 Prj1-1 전체 회귀 검증
+
+### IV.D 시험 및 평가 — 최종 회귀 결과
+
+1-1-8 완료 시점에 `make check` 와 `make grade` 를 수행했다.
+
+```
+TOTAL TESTING SCORE: 41.3%
+
+tests/userprog/Rubric.functionality   66/108
+tests/userprog/Rubric.robustness      70/ 88
+tests/userprog/no-vm/Rubric            0/  1
+tests/filesys/base/Rubric              0/ 30
+```
+
+1-1-7 시점 결과와 점수가 완전히 동일하다. 1-1-8 의 변경(시스템 콜 번호 추가, Arg 배열 확장)이 기존 동작에 어떤 영향도 주지 않았음을 뜻한다.
+
+Prj1-1 채점 대상 21개는 전부 만점이다. 배점은 args 계열 3점씩, exec / wait / exit / sc-boundary 계열 5점씩, halt 3점, multi-recurse 15점이다.
+
+남은 35개 실패는 모두 파일 시스템 관련(create, open, read, write, close, rox 계열과 tests/filesys/base/\*)으로 Prj1-2 범위다. 다만 현재 Robustness 가 70 / 88 로 높게 나오는 것은 착시가 섞여 있다. 파일 관련 시스템 콜이 아직 없어 syscall_handler 의 default 분기에서 exit(-1) 로 떨어지는데, 그 결과가 우연히 기대 출력과 맞은 항목이 있기 때문이다. create-empty 가 3 / 3 인데 create-normal 이 0 / 3 인 것이 그 예다. Prj1-2 에서 실제 구현을 넣으면 이 항목들이 일시적으로 깨질 수 있다.
+
+증거 파일
+
+- docs/verify/1-1-9-check.txt : make check 전체 출력
+- docs/verify/1-1-9-grade.txt : make grade 결과
+
+### git 커밋 1회차
+
+지침서 6.1 에 따라 Prj1-1 전체 검증 통과 직후 1회차 커밋을 남겼다. 커밋 범위에 build/ 와 오브젝트 파일이 포함되지 않았음을 레포에서 확인했다.
+
+---
+
+## 캡처 보관 위치
+
+- docs/verify/1-1-1-baseline.txt : 구현 전 make check 결과
+- docs/verify/1-1-9-check.txt, 1-1-9-grade.txt : Prj1-1 완료 시점 결과
+- docs/verify/ : 단계별 검증 화면 캡처를 1-x-y.png 형식으로 누적
+
+## 남은 임시 코드
+
+- 없음 (process_wait () 의 임시 대기 루프는 1-1-7 에서 제거됨)
+
+## 아직 남기지 않은 캡처
+
+- 1-1-2 hex_dump 스택 배치 (본 문서에 텍스트로는 기록됨)
+- echo x 실행 화면
+- additional 10 20 62 40 → 55 62 (보고서 V.A 필수)
+- 최종 make check 결과 (제출 전 필수)
