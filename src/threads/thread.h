@@ -18,6 +18,15 @@
           thread.h 를 되부르지 않는다, 즉 순환 참조가 생기지 않는다 */
 #include "threads/vaddr.h"
 
+/* [2-2-4] Priority Aging : aging 사용 여부 플래그 선언
+   목적 : 커널 옵션 -aging 이 주어졌는지 다른 파일에서 확인할 수 있게 한다
+   참고 : 조교 슬라이드 30 - 31
+   주의 : -aging 커널 옵션이 있을 때만 true, userprog 빌드에서는 선언되지 않는다 */
+#ifndef USERPROG
+/* Project #3. */
+extern bool thread_prior_aging;
+#endif
+
 /* States in a thread's life cycle. */
 enum thread_status
   {
@@ -226,6 +235,19 @@ void thread_yield (void);
    참고 : Pintos manual 2.2.2, 조교 슬라이드 24 */
 void thread_sleep (int64_t wakeup_tick);
 void thread_wake_up (void);
+
+/* [2-2-1] Priority Scheduling : 우선순위 내림차순 비교 함수 선언
+   참고 : Pintos manual 2.2.3, 조교 슬라이드 25 - 27 */
+bool thread_priority_greater (const struct list_elem *a,
+                              const struct list_elem *b, void *aux);
+
+/* [2-2-2] Priority Scheduling : 선점 검사 함수 선언
+   참고 : Pintos manual 2.2.3, 조교 슬라이드 26 - 27 */
+void thread_check_preempt (void);
+
+/* [2-2-5] Priority Aging : ready_list 스레드 우선순위 올리기 선언
+   참고 : 조교 슬라이드 30, 32 */
+void thread_aging (void);
 
 /* Performs some operation on thread t, given auxiliary data AUX. */
 typedef void thread_action_func (struct thread *t, void *aux);

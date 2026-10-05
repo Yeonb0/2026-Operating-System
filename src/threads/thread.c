@@ -61,6 +61,15 @@ static long long user_ticks;    /* # of timer ticks in user programs. */
 #define TIME_SLICE 4            /* # of timer ticks to give each thread. */
 static unsigned thread_ticks;   /* # of timer ticks since last yield. */
 
+/* [2-2-4] Priority Aging : aging 사용 여부 플래그 정의
+   목적 : 커널 옵션 -aging 이 주어졌는지 저장한다 (기본값 false)
+   참고 : 조교 슬라이드 30 - 31
+   주의 : -aging 커널 옵션이 있을 때만 true, userprog 빌드에서는 선언되지 않는다 */
+#ifndef USERPROG
+/* Project #3. */
+bool thread_prior_aging;
+#endif
+
 /* If false (default), use round-robin scheduler.
    If true, use multi-level feedback queue scheduler.
    Controlled by kernel command-line option "-o mlfqs". */
@@ -169,6 +178,15 @@ thread_tick (void)
 #ifndef USERPROG
   /* Project #3. */
   thread_wake_up ();
+
+  /* [2-2-5] 수정 : aging 호출 추가
+     변경 내용 : 기존 #ifndef USERPROG 블록 안에 thread_aging () 호출 추가
+     변경 이유 : -aging 일 때 매 tick 마다 ready_list 스레드의 우선순위를 올리기 위해
+                 (조교 슬라이드 31)
+     영향 범위 : thread_tick () 만, -aging 이 없으면 동작이 같다 */
+  /* Project #3. */
+  if (thread_prior_aging == true)
+    thread_aging ();
 #endif
 }
 
@@ -246,6 +264,12 @@ thread_create (const char *name, int priority,
   /* Add to run queue. */
   thread_unblock (t);
 
+  /* [2-2-2] 수정 : 생성 직후 선점 검사 추가
+     변경 내용 : thread_unblock (t) 다음에 thread_check_preempt () 호출 추가
+     변경 이유 : 새 스레드의 우선순위가 더 높으면 바로 양보하기 위해
+     영향 범위 : thread_create () 만, 반환값은 그대로 */
+  thread_check_preempt ();
+
   return tid;
 }
 
@@ -282,7 +306,11 @@ thread_unblock (struct thread *t)
 
   old_level = intr_disable ();
   ASSERT (t->status == THREAD_BLOCKED);
-  list_push_back (&ready_list, &t->elem);
+  /* [2-2-1] 수정 : ready_list 삽입을 우선순위 정렬 삽입으로 교체
+     변경 내용 : list_push_back 을 list_insert_ordered 로 교체
+     변경 이유 : ready_list 를 우선순위 내림차순으로 유지하기 위해
+     영향 범위 : thread_unblock () 만, 인터럽트 구간과 양보 없음은 그대로 */
+  list_insert_ordered (&ready_list, &t->elem, thread_priority_greater, NULL);
   t->status = THREAD_READY;
   intr_set_level (old_level);
 }
@@ -353,7 +381,12 @@ thread_yield (void)
 
   old_level = intr_disable ();
   if (cur != idle_thread) 
-    list_push_back (&ready_list, &cur->elem);
+    /* [2-2-1] 수정 : ready_list 삽입을 우선순위 정렬 삽입으로 교체
+       변경 내용 : list_push_back 을 list_insert_ordered 로 교체
+       변경 이유 : ready_list 를 우선순위 내림차순으로 유지하기 위해
+       영향 범위 : thread_yield () 만, idle 스레드 제외 조건은 그대로 */
+    list_insert_ordered (&ready_list, &cur->elem, thread_priority_greater,
+                         NULL);
   cur->status = THREAD_READY;
   schedule ();
   intr_set_level (old_level);
@@ -405,6 +438,13 @@ thread_wake_up (void)
       list_pop_front (&Sleep_list);
       thread_unblock (t);
     }
+
+  /* [2-2-2] 수정 : 깨운 뒤 선점 검사 추가
+     변경 내용 : while 루프 뒤에 thread_check_preempt () 호출 추가
+     변경 이유 : 깨운 스레드가 더 높으면 인터럽트 복귀 시 양보하기 위해
+     영향 범위 : thread_wake_up () 만, 인터럽트 컨텍스트라 intr_yield_on_return ()
+                 이 쓰인다 */
+  thread_check_preempt ();
 }
 
 /* [2-1-2] Alarm Clock : Sleep_list 정렬 비교 함수
@@ -419,6 +459,77 @@ wakeup_tick_less (const struct list_elem *a, const struct list_elem *b,
 {
   return list_entry (a, struct thread, elem)->wakeup_tick
          < list_entry (b, struct thread, elem)->wakeup_tick;
+}
+
+/* [2-2-1] Priority Scheduling : ready_list 우선순위 비교 함수
+   목적 : priority 내림차순 정렬 기준 제공
+   입력 : a, b - 비교할 list_elem
+   출력 : a 의 priority 가 b 보다 크면 true, 같거나 작으면 false
+   참고 : Pintos manual 2.2.3, 조교 슬라이드 25 - 27
+   주의 : 같은 우선순위는 false 를 돌려 삽입 순서를 유지한다,
+          2-2-3 에서 synch.c 도 사용한다 */
+bool
+thread_priority_greater (const struct list_elem *a, const struct list_elem *b,
+                         void *aux UNUSED)
+{
+  return list_entry (a, struct thread, elem)->priority
+         > list_entry (b, struct thread, elem)->priority;
+}
+
+/* [2-2-2] Priority Scheduling : ready_list 맨 앞이 더 높으면 양보
+   목적 : ready_list 맨 앞 스레드의 priority 가 현재보다 크면 CPU 를 양보
+   입력 : 없음
+   출력 : 없음
+   참고 : Pintos manual 2.2.3, 조교 슬라이드 26 - 27
+   주의 : 같은 우선순위면 양보하지 않는다,
+          인터럽트 컨텍스트에서는 intr_yield_on_return () 을 쓴다,
+          thread_unblock () 은 선점하지 않으므로 unblock 한 쪽이 이 함수를 부른다 */
+void
+thread_check_preempt (void)
+{
+  enum intr_level old_level;
+  bool need_yield = false;
+
+  old_level = intr_disable ();
+  if (!list_empty (&ready_list)
+      && list_entry (list_front (&ready_list), struct thread, elem)->priority
+         > thread_current ()->priority)
+    need_yield = true;
+  intr_set_level (old_level);
+
+  if (need_yield)
+    {
+      if (intr_context ())
+        intr_yield_on_return ();
+      else
+        thread_yield ();
+    }
+}
+
+/* [2-2-5] Priority Aging : ready_list 스레드 우선순위 1 씩 올리기
+   목적 : ready 에 오래 머문 스레드가 결국 실행되도록 우선순위를 올린다
+   입력 : 없음
+   출력 : 없음
+   참고 : 조교 슬라이드 30, 32
+   주의 : 매 tick 마다 ready_list 의 모든 스레드를 1 씩 올리므로 ready 에 머문 시간에 비례한다,
+          모두 같은 폭으로 오르므로 내림차순이 유지되어 재정렬하지 않는다,
+          PRI_MAX 에서 멈춘다, 인터럽트 컨텍스트에서 불린다 */
+void
+thread_aging (void)
+{
+  struct list_elem *e;
+
+  ASSERT (intr_get_level () == INTR_OFF);
+
+  for (e = list_begin (&ready_list); e != list_end (&ready_list);
+       e = list_next (e))
+    {
+      struct thread *t = list_entry (e, struct thread, elem);
+      if (t->priority < PRI_MAX)
+        t->priority++;
+    }
+
+  thread_check_preempt ();
 }
 
 /* Invoke function 'func' on all threads, passing along 'aux'.
@@ -443,6 +554,11 @@ void
 thread_set_priority (int new_priority) 
 {
   thread_current ()->priority = new_priority;
+  /* [2-2-2] 수정 : 우선순위 변경 직후 선점 검사 추가
+     변경 내용 : 대입 다음에 thread_check_preempt () 호출 추가
+     변경 이유 : 낮춘 결과 ready_list 맨 앞이 더 높아지면 바로 양보하기 위해
+     영향 범위 : thread_set_priority () 만 */
+  thread_check_preempt ();
 }
 
 /* Returns the current thread's priority. */

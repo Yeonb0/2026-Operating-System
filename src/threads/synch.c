@@ -68,7 +68,14 @@ sema_down (struct semaphore *sema)
   old_level = intr_disable ();
   while (sema->value == 0) 
     {
-      list_push_back (&sema->waiters, &thread_current ()->elem);
+      /* [2-2-3] 수정 : 세마포어 대기열을 우선순위 정렬 삽입으로 교체
+         변경 내용 : list_push_back 을 list_insert_ordered 로 교체
+         변경 이유 : waiters 를 우선순위 내림차순으로 유지해 sema_up () 이
+                     가장 높은 스레드를 깨우도록 한다
+                     (Pintos manual 2.2.3, 조교 슬라이드 16 - 17, 26)
+         영향 범위 : sema_down () 만, lock 은 내부 세마포어로 자동 적용 */
+      list_insert_ordered (&sema->waiters, &thread_current ()->elem,
+                           thread_priority_greater, NULL);
       thread_block ();
     }
   sema->value--;
@@ -118,6 +125,14 @@ sema_up (struct semaphore *sema)
                                 struct thread, elem));
   sema->value++;
   intr_set_level (old_level);
+  /* [2-2-3] 수정 : sema_up () 끝에 선점 검사 추가
+     변경 내용 : intr_set_level 다음에 thread_check_preempt () 호출 추가
+     변경 이유 : 깨어난 스레드가 더 높으면 바로 양보하기 위해
+                 (Pintos manual 2.2.3, 조교 슬라이드 16 - 17, 26)
+     영향 범위 : sema_up () 만
+     주의 : value++ 뒤에 양보해야 깨어난 스레드가 바로 값을 얻는다,
+            인터럽트 컨텍스트에서는 intr_yield_on_return () 이 쓰인다 */
+  thread_check_preempt ();
 }
 
 static void sema_test_helper (void *sema_);

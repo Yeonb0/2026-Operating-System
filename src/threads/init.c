@@ -256,6 +256,16 @@ parse_options (char **argv)
         random_init (atoi (value));
       else if (!strcmp (name, "-mlfqs"))
         thread_mlfqs = true;
+      /* [2-2-4] Priority Aging : -aging 커널 옵션 처리
+         목적 : -aging 이 주어지면 thread_prior_aging 을 true 로 한다
+         참고 : 조교 슬라이드 30 - 31
+         주의 : 슬라이드 31 배치를 그대로 따른다,
+                Make.tests 가 priority-aging 에 -aging 을 붙인다 */
+#ifndef USERPROG
+      /* Project #3. */
+      else if (!strcmp (name, "-aging"))
+        thread_prior_aging = true;
+#endif
 #ifdef USERPROG
       else if (!strcmp (name, "-ul"))
         user_page_limit = atoi (value);
