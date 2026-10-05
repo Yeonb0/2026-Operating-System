@@ -92,8 +92,24 @@ timer_sleep (int64_t ticks)
   int64_t start = timer_ticks ();
 
   ASSERT (intr_get_level () == INTR_ON);
+  /* [2-1-3] 수정 : busy waiting 을 thread_sleep () 호출로 교체 (threads 빌드)
+     변경 내용 : #ifndef USERPROG 안에 thread_sleep () 호출 추가,
+                 기존 while 루프는 #else 쪽에 그대로 유지
+     변경 이유 : thread_yield () 를 반복하는 busy waiting 을 없애기 위해
+     영향 범위 : timer_sleep () 만, userprog 빌드는 동작이 같다 */
+  /* [2-1-3] Alarm Clock : 깨어날 시각까지 스레드 재우기
+     목적 : 아직 시간이 남았으면 start + ticks 까지 thread_sleep () 으로 재운다
+     참고 : Pintos manual 2.2.2, 조교 슬라이드 23 - 24, 조교 슬라이드 31
+     주의 : 슬라이드 31 의 thread_wake_up () 이 #ifndef USERPROG 안에 있으므로
+            같은 조건으로 묶는다, userprog 빌드는 원본 busy waiting 을 유지한다
+            ticks <= 0 이면 재우지 않고 바로 돌아온다 */
+#ifndef USERPROG
+  if (timer_elapsed (start) < ticks)
+    thread_sleep (start + ticks);
+#else
   while (timer_elapsed (start) < ticks) 
     thread_yield ();
+#endif
 }
 
 /* Sleeps for approximately MS milliseconds.  Interrupts must be

@@ -122,6 +122,13 @@ struct thread
     /* Shared between thread.c and synch.c. */
     struct list_elem elem;              /* List element. */
 
+    /* [2-1-2] Alarm Clock : 깨어날 절대 tick 저장
+       목적 : timer_sleep () 이 busy waiting 없이 스레드를 재우기 위한 필드
+       참고 : Pintos manual 2.2.2, 조교 슬라이드 24
+       주의 : elem 은 BLOCKED 상태에서 Sleep_list 에도 쓰인다
+              조건부 컴파일 밖에 둔다 */
+    int64_t wakeup_tick;                /* Tick at which to wake up. */
+
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
@@ -214,6 +221,11 @@ const char *thread_name (void);
 
 void thread_exit (void) NO_RETURN;
 void thread_yield (void);
+
+/* [2-1-2] Alarm Clock : 재우기와 깨우기 선언
+   참고 : Pintos manual 2.2.2, 조교 슬라이드 24 */
+void thread_sleep (int64_t wakeup_tick);
+void thread_wake_up (void);
 
 /* Performs some operation on thread t, given auxiliary data AUX. */
 typedef void thread_action_func (struct thread *t, void *aux);

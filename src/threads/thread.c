@@ -11,6 +11,7 @@
 #include "threads/switch.h"
 #include "threads/synch.h"
 #include "threads/vaddr.h"
+#include "devices/timer.h"
 #ifdef USERPROG
 #include "userprog/process.h"
 #endif
@@ -27,6 +28,12 @@ static struct list ready_list;
 /* List of all processes.  Processes are added to this list
    when they are first scheduled and removed when they exit. */
 static struct list all_list;
+
+/* [2-1-2] Alarm Clock : 잠든 스레드 목록
+   목적 : 잠든 스레드를 wakeup_tick 오름차순으로 보관
+   참고 : Pintos manual 2.2.2, 조교 슬라이드 24
+   주의 : 접근할 때는 인터럽트가 꺼져 있어야 한다 */
+static struct list Sleep_list;
 
 /* Idle thread. */
 static struct thread *idle_thread;
@@ -71,6 +78,10 @@ static void schedule (void);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
 
+/* [2-1-2] Alarm Clock : Sleep_list 정렬용 비교 함수 선언 */
+static bool wakeup_tick_less (const struct list_elem *a,
+                              const struct list_elem *b, void *aux UNUSED);
+
 /* Initializes the threading system by transforming the code
    that's currently running into a thread.  This can't work in
    general and it is possible in this case only because loader.S
@@ -91,6 +102,11 @@ thread_init (void)
 
   lock_init (&tid_lock);
   list_init (&ready_list);
+  /* [2-1-2] 수정 : Sleep_list 초기화 추가
+     변경 내용 : list_init (&Sleep_list) 한 줄 추가
+     변경 이유 : thread_sleep () 이 쓰기 전에 목록을 초기화해야 한다
+     영향 범위 : thread_init () 만, 기존 동작은 그대로 */
+  list_init (&Sleep_list);
   list_init (&all_list);
 
   /* Set up a thread structure for the running thread. */
@@ -137,6 +153,23 @@ thread_tick (void)
   /* Enforce preemption. */
   if (++thread_ticks >= TIME_SLICE)
     intr_yield_on_return ();
+
+  /* [2-1-2] 수정 : 깨우기 호출 추가
+     변경 내용 : 선점 처리 아래에 thread_wake_up () 호출 추가
+     변경 이유 : 매 tick 마다 깰 시간이 된 스레드를 깨우기 위해
+     영향 범위 : thread_tick () 만, 호출하는 쪽이 없으면 Sleep_list 가
+                 비어 있어 동작이 같다 */
+  /* [2-1-2] Alarm Clock : 매 tick 마다 잠든 스레드 깨우기
+     목적 : wakeup_tick 이 지난 스레드를 Sleep_list 에서 꺼내 깨운다
+     입력 : 없음
+     출력 : 없음
+     참고 : Pintos manual 2.2.2, 조교 슬라이드 24, 조교 슬라이드 31
+     주의 : 슬라이드 31 배치를 따라 #ifndef USERPROG 안에 둔다,
+            userprog 빌드에서는 호출되지 않는다 */
+#ifndef USERPROG
+  /* Project #3. */
+  thread_wake_up ();
+#endif
 }
 
 /* Prints thread statistics. */
@@ -324,6 +357,68 @@ thread_yield (void)
   cur->status = THREAD_READY;
   schedule ();
   intr_set_level (old_level);
+}
+
+/* [2-1-2] Alarm Clock : 현재 스레드를 WAKEUP_TICK 까지 재운다
+   목적 : 현재 스레드를 Sleep_list 에 정렬 삽입하고 BLOCKED 로 만든다
+   입력 : wakeup_tick - 깨어날 절대 tick
+   출력 : 없음
+   참고 : Pintos manual 2.2.2, 조교 슬라이드 24
+   주의 : 인터럽트를 끈 상태에서 목록을 조작하고 thread_block () 을 부른다
+          idle 스레드는 재울 수 없다 */
+void
+thread_sleep (int64_t wakeup_tick)
+{
+  struct thread *cur = thread_current ();
+  enum intr_level old_level;
+
+  ASSERT (!intr_context ());
+
+  old_level = intr_disable ();
+  ASSERT (cur != idle_thread);
+
+  cur->wakeup_tick = wakeup_tick;
+  list_insert_ordered (&Sleep_list, &cur->elem, wakeup_tick_less, NULL);
+  thread_block ();
+  intr_set_level (old_level);
+}
+
+/* [2-1-2] Alarm Clock : 깰 시간이 된 스레드를 모두 깨운다
+   목적 : Sleep_list 앞쪽부터 wakeup_tick <= 현재 tick 인 스레드를 unblock
+   입력 : 없음
+   출력 : 없음
+   참고 : Pintos manual 2.2.2, 조교 슬라이드 24
+   주의 : timer_interrupt () -> thread_tick () 경로의 인터럽트 컨텍스트에서
+          불린다, thread_unblock () 만 쓰고 yield · block · sema_down ·
+          lock_acquire 는 부르지 않는다 */
+void
+thread_wake_up (void)
+{
+  int64_t now = timer_ticks ();
+
+  while (!list_empty (&Sleep_list))
+    {
+      struct thread *t = list_entry (list_front (&Sleep_list),
+                                     struct thread, elem);
+      if (t->wakeup_tick > now)
+        break;
+      list_pop_front (&Sleep_list);
+      thread_unblock (t);
+    }
+}
+
+/* [2-1-2] Alarm Clock : Sleep_list 정렬 비교 함수
+   목적 : wakeup_tick 오름차순 정렬 기준 제공
+   입력 : a, b - 비교할 list_elem
+   출력 : a 의 wakeup_tick 이 b 보다 작으면 true
+   참고 : Pintos manual 2.2.2, 조교 슬라이드 24
+   주의 : 같으면 false, 같은 tick 끼리는 먼저 잔 순서가 유지된다 */
+static bool
+wakeup_tick_less (const struct list_elem *a, const struct list_elem *b,
+                  void *aux UNUSED)
+{
+  return list_entry (a, struct thread, elem)->wakeup_tick
+         < list_entry (b, struct thread, elem)->wakeup_tick;
 }
 
 /* Invoke function 'func' on all threads, passing along 'aux'.
