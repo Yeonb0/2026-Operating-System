@@ -12,6 +12,11 @@
 #include "threads/synch.h"
 #include "threads/vaddr.h"
 #include "devices/timer.h"
+/* [2-3-1] 수정 : 고정소수점 헤더 포함 추가
+   변경 내용 : #include "threads/fixed-point.h" 한 줄 추가
+   변경 이유 : BSD Scheduler 의 recent_cpu, load_avg 계산에 쓰기 위해
+   영향 범위 : 아직 호출하는 곳이 없어 동작은 같다 */
+#include "threads/fixed-point.h"
 #ifdef USERPROG
 #include "userprog/process.h"
 #endif
@@ -75,6 +80,12 @@ bool thread_prior_aging;
    Controlled by kernel command-line option "-o mlfqs". */
 bool thread_mlfqs;
 
+/* [2-3-2] BSD Scheduler : 시스템 전체 load_avg
+   목적 : ready 상태 스레드 수의 평균 추정값을 저장한다
+   참고 : 조교 슬라이드 39, Pintos manual B.4
+   주의 : 17.14 고정소수점 값이다, 부팅 때 0 으로 초기화한다 */
+static int load_avg;
+
 static void kernel_thread (thread_func *, void *aux);
 
 static void idle (void *aux UNUSED);
@@ -117,6 +128,11 @@ thread_init (void)
      영향 범위 : thread_init () 만, 기존 동작은 그대로 */
   list_init (&Sleep_list);
   list_init (&all_list);
+  /* [2-3-2] 수정 : load_avg 초기화 추가
+     변경 내용 : load_avg = fp_from_int (0) 한 줄 추가
+     변경 이유 : 슬라이드 39 - 부팅 때 load_avg 는 0 이다
+     영향 범위 : thread_init () 만, 기존 동작은 그대로 */
+  load_avg = fp_from_int (0);
 
   /* Set up a thread structure for the running thread. */
   initial_thread = running_thread ();
@@ -187,6 +203,13 @@ thread_tick (void)
   /* Project #3. */
   if (thread_prior_aging == true)
     thread_aging ();
+
+  /* [2-3-3] 수정 : mlfqs 처리 호출 추가
+     변경 내용 : 기존 #ifndef USERPROG 블록 안에 thread_mlfqs_tick () 호출 추가
+     변경 이유 : -mlfqs 일 때 매 tick 마다 recent_cpu, load_avg, 우선순위를 갱신하기 위해
+     영향 범위 : thread_tick () 만, -mlfqs 가 없으면 동작이 같다 */
+  if (thread_mlfqs)
+    thread_mlfqs_tick ();
 #endif
 }
 
@@ -222,6 +245,7 @@ thread_create (const char *name, int priority,
   struct switch_entry_frame *ef;
   struct switch_threads_frame *sf;
   tid_t tid;
+  enum intr_level old_level;
 
   ASSERT (function != NULL);
 
@@ -245,6 +269,24 @@ thread_create (const char *name, int priority,
   t->Parent = thread_current ();
   list_push_back (&thread_current ()->Child_list, &t->Child_elem);
 #endif
+
+  /* [2-3-2] 수정 : nice, recent_cpu 상속과 초기 우선순위 계산 추가
+     변경 내용 : 부모의 nice, recent_cpu 를 복사하고 thread_mlfqs 이면 우선순위를 계산
+     변경 이유 : 슬라이드 36, 38 - 부모 값을 물려받는다,
+                 슬라이드 37 - 초기 우선순위는 thread_create () 에서 정한다
+     영향 범위 : thread_create () 만, thread_mlfqs 가 아니면 우선순위는 인자 그대로다,
+                 thread_unblock () 의 정렬 삽입 전에 우선순위가 정해진다 */
+  old_level = intr_disable ();
+  t->nice = thread_current ()->nice;
+  t->recent_cpu = thread_current ()->recent_cpu;
+  /* [2-3-3] 수정 : idle 스레드를 초기 우선순위 계산에서 제외
+     변경 내용 : 조건을 thread_mlfqs && function != idle 로 바꿈
+     변경 이유 : idle 이 공식으로 63 이 되면 깨운 스레드가 idle 을 선점하지 못한다,
+                 원본처럼 idle 은 PRI_MIN 을 유지한다
+     영향 범위 : thread_create () 만, idle 이 아닌 스레드는 2-3-2 와 같다 */
+  if (thread_mlfqs && function != idle)
+    thread_calc_priority (t);
+  intr_set_level (old_level);
 
   /* Stack frame for kernel_thread(). */
   kf = alloc_frame (t, sizeof *kf);
@@ -532,6 +574,99 @@ thread_aging (void)
   thread_check_preempt ();
 }
 
+/* [2-3-2] BSD Scheduler : nice 와 recent_cpu 로 우선순위 다시 계산
+   목적 : T 의 priority 를 PRI_MAX - (recent_cpu / 4) - (nice * 2) 로 정한다
+   입력 : T - 우선순위를 다시 계산할 스레드
+   출력 : 없음, T->priority 를 바꾼다
+   참고 : 조교 슬라이드 37, 40, Pintos manual B.2
+   주의 : 소수점 아래는 버리고 PRI_MIN ~ PRI_MAX 로 자른다,
+          ready_list 위치와 선점은 호출한 쪽이 맞춘다,
+          인터럽트를 끈 상태에서 부른다 */
+void
+thread_calc_priority (struct thread *t)
+{
+  int priority;
+
+  ASSERT (intr_get_level () == INTR_OFF);
+
+  priority = fp_to_int_zero (fp_sub_int (fp_sub (fp_from_int (PRI_MAX),
+                                                 fp_div_int (t->recent_cpu, 4)),
+                                         t->nice * 2));
+  if (priority < PRI_MIN)
+    priority = PRI_MIN;
+  else if (priority > PRI_MAX)
+    priority = PRI_MAX;
+  t->priority = priority;
+}
+
+/* [2-3-3] BSD Scheduler : 한 스레드의 recent_cpu 재계산
+   목적 : recent_cpu = (2 * load_avg) / (2 * load_avg + 1) * recent_cpu + nice 를 적용한다
+   입력 : T - 대상 스레드, AUX - 쓰지 않음
+   출력 : 없음, T->recent_cpu 를 바꾼다
+   참고 : 조교 슬라이드 38, Pintos manual B.3
+   주의 : 넘침을 막기 위해 계수를 먼저 구한 뒤 곱한다,
+          thread_foreach () 로 모든 스레드에 1초마다 부른다 */
+static void
+thread_update_recent_cpu (struct thread *t, void *aux UNUSED)
+{
+  int coef = fp_div (fp_mul_int (load_avg, 2),
+                     fp_add_int (fp_mul_int (load_avg, 2), 1));
+  t->recent_cpu = fp_add_int (fp_mul (coef, t->recent_cpu), t->nice);
+}
+
+/* [2-3-3] BSD Scheduler : 한 스레드의 우선순위 재계산
+   목적 : thread_foreach () 로 모든 스레드의 우선순위를 다시 계산한다
+   입력 : T - 대상 스레드, AUX - 쓰지 않음
+   출력 : 없음, T->priority 를 바꾼다
+   참고 : 조교 슬라이드 37, 40
+   주의 : idle 스레드는 PRI_MIN 을 유지하도록 건너뛴다 */
+static void
+thread_update_priority (struct thread *t, void *aux UNUSED)
+{
+  if (t != idle_thread)
+    thread_calc_priority (t);
+}
+
+/* [2-3-3] BSD Scheduler : 매 tick 의 mlfqs 처리
+   목적 : recent_cpu 증가, 1초마다 load_avg 와 recent_cpu 재계산, 4 tick 마다 우선순위 재계산
+   입력 : 없음
+   출력 : 없음
+   참고 : 조교 슬라이드 37 - 40, Pintos manual B.2 - B.4
+   주의 : 1초마다 load_avg 를 먼저 갱신하고 그 값으로 recent_cpu 를 계산한다,
+          ready_threads 와 recent_cpu 증가에서 idle 은 뺀다,
+          1개 큐(정렬된 ready_list)를 쓰므로 우선순위 재계산 뒤 다시 정렬한다,
+          인터럽트 컨텍스트에서 불린다 */
+void
+thread_mlfqs_tick (void)
+{
+  struct thread *cur = thread_current ();
+  int64_t now = timer_ticks ();
+  int ready_threads;
+
+  ASSERT (intr_get_level () == INTR_OFF);
+
+  if (cur != idle_thread)
+    cur->recent_cpu = fp_add_int (cur->recent_cpu, 1);
+
+  if (now % TIMER_FREQ == 0)
+    {
+      ready_threads = (int) list_size (&ready_list)
+                      + (cur != idle_thread ? 1 : 0);
+      load_avg = fp_add (fp_mul (fp_div (fp_from_int (59), fp_from_int (60)),
+                                 load_avg),
+                         fp_mul_int (fp_div (fp_from_int (1), fp_from_int (60)),
+                                     ready_threads));
+      thread_foreach (thread_update_recent_cpu, NULL);
+    }
+
+  if (now % TIME_SLICE == 0)
+    {
+      thread_foreach (thread_update_priority, NULL);
+      list_sort (&ready_list, thread_priority_greater, NULL);
+      thread_check_preempt ();
+    }
+}
+
 /* Invoke function 'func' on all threads, passing along 'aux'.
    This function must be called with interrupts off. */
 void
@@ -573,6 +708,20 @@ void
 thread_set_nice (int nice UNUSED) 
 {
   /* Not yet implemented. */
+  /* [2-3-2] 수정 : nice 설정 구현
+     변경 내용 : nice 를 저장하고 thread_mlfqs 이면 우선순위를 다시 계산한 뒤 선점 검사
+     변경 이유 : 슬라이드 36 - 새 nice 로 우선순위를 다시 계산하고, 더 이상 가장 높지 않으면 양보한다
+     영향 범위 : thread_set_nice () 만, 원본 서명의 UNUSED 와 주석은 그대로 둔다 */
+  enum intr_level old_level;
+
+  old_level = intr_disable ();
+  thread_current ()->nice = nice;
+  if (thread_mlfqs)
+    thread_calc_priority (thread_current ());
+  intr_set_level (old_level);
+
+  if (thread_mlfqs)
+    thread_check_preempt ();
 }
 
 /* Returns the current thread's nice value. */
@@ -580,7 +729,11 @@ int
 thread_get_nice (void) 
 {
   /* Not yet implemented. */
-  return 0;
+  /* [2-3-2] 수정 : nice 반환 구현
+     변경 내용 : return 0 을 현재 스레드의 nice 반환으로 교체
+     변경 이유 : 슬라이드 36 - 현재 스레드의 nice 를 돌려준다
+     영향 범위 : thread_get_nice () 만 */
+  return thread_current ()->nice;
 }
 
 /* Returns 100 times the system load average. */
@@ -588,7 +741,17 @@ int
 thread_get_load_avg (void) 
 {
   /* Not yet implemented. */
-  return 0;
+  /* [2-3-2] 수정 : load_avg 반환 구현
+     변경 내용 : return 0 을 load_avg 의 100 배 반올림 값 반환으로 교체
+     변경 이유 : 슬라이드 39 - 100 배 값을 가장 가까운 정수로 반올림한다
+     영향 범위 : thread_get_load_avg () 만 */
+  enum intr_level old_level;
+  int value;
+
+  old_level = intr_disable ();
+  value = fp_to_int_nearest (fp_mul_int (load_avg, 100));
+  intr_set_level (old_level);
+  return value;
 }
 
 /* Returns 100 times the current thread's recent_cpu value. */
@@ -596,7 +759,17 @@ int
 thread_get_recent_cpu (void) 
 {
   /* Not yet implemented. */
-  return 0;
+  /* [2-3-2] 수정 : recent_cpu 반환 구현
+     변경 내용 : return 0 을 현재 스레드 recent_cpu 의 100 배 올림 값 반환으로 교체
+     변경 이유 : 슬라이드 38 - 100 배 값을 올림한다 (지침 7.1, 올림 채택)
+     영향 범위 : thread_get_recent_cpu () 만 */
+  enum intr_level old_level;
+  int value;
+
+  old_level = intr_disable ();
+  value = fp_to_int_up (fp_mul_int (thread_current ()->recent_cpu, 100));
+  intr_set_level (old_level);
+  return value;
 }
 
 /* Idle thread.  Executes when no other thread is ready to run.
@@ -686,6 +859,13 @@ init_thread (struct thread *t, const char *name, int priority)
   t->stack = (uint8_t *) t + PGSIZE;
   t->priority = priority;
   t->magic = THREAD_MAGIC;
+  /* [2-3-2] 수정 : nice, recent_cpu 초기화 추가
+     변경 내용 : 두 필드를 0 으로 대입
+     변경 이유 : 슬라이드 36, 38 - 처음 만든 스레드는 0 이다,
+                 부모 값 상속은 thread_current () 를 쓸 수 있는 thread_create () 에서 한다
+     영향 범위 : init_thread () 만, memset 으로 이미 0 이므로 값은 같다 */
+  t->nice = 0;
+  t->recent_cpu = fp_from_int (0);
 
 #ifdef USERPROG
   /* [1-1-7] exec, wait : 부모-자식 관리 필드 초기화

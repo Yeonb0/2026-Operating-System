@@ -138,6 +138,15 @@ struct thread
               조건부 컴파일 밖에 둔다 */
     int64_t wakeup_tick;                /* Tick at which to wake up. */
 
+    /* [2-3-2] BSD Scheduler : 스레드별 nice 와 recent_cpu
+       목적 : 우선순위 공식 PRI_MAX - (recent_cpu / 4) - (nice * 2) 에 쓸 값을 저장한다
+       참고 : 조교 슬라이드 36 - 38, Pintos manual B.1 - B.3
+       주의 : nice 는 -20 ~ 20 정수, recent_cpu 는 17.14 고정소수점 값이다,
+              처음 만든 스레드는 0, 그 밖에는 부모 값을 물려받는다,
+              조건부 컴파일 밖에 둔다 */
+    int nice;
+    int recent_cpu;
+
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
@@ -248,6 +257,14 @@ void thread_check_preempt (void);
 /* [2-2-5] Priority Aging : ready_list 스레드 우선순위 올리기 선언
    참고 : 조교 슬라이드 30, 32 */
 void thread_aging (void);
+
+/* [2-3-2] BSD Scheduler : 우선순위 계산 함수 선언
+   참고 : 조교 슬라이드 37, Pintos manual B.2 */
+void thread_calc_priority (struct thread *t);
+
+/* [2-3-3] BSD Scheduler : 매 tick mlfqs 처리 함수 선언
+   참고 : 조교 슬라이드 37 - 40 */
+void thread_mlfqs_tick (void);
 
 /* Performs some operation on thread t, given auxiliary data AUX. */
 typedef void thread_action_func (struct thread *t, void *aux);
