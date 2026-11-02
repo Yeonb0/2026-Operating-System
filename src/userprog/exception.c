@@ -174,6 +174,18 @@ page_fault (struct intr_frame *f)
       if (p != NULL && p->kpage == NULL && (!write || p->writable)
           && handle_mm_fault (p))
         return;
+      /* [3-3-1] Stack Growth : SPT 에 없는 주소의 스택 확장
+         변경 내용 : 항목이 없는 주소가 스택 접근으로 보이면 page_grow_stack () 으로 페이지를 붙이고 반환한다
+         변경 이유 : SPT 에 없는 주소라도 스택 접근으로 보이면 스택을 늘린다 (조교 슬라이드 11 Growable region),
+                     커널 문맥에서는 f->esp 가 정의되지 않으므로 user_esp 를 쓴다 (매뉴얼 4.3.3)
+         영향 범위 : page_fault () 의 VM 블록, VM 빌드만 */
+      if (p == NULL)
+        {
+          void *esp = user ? f->esp : thread_current ()->user_esp;
+          if (page_is_stack_access (fault_addr, esp)
+              && page_grow_stack (fault_addr))
+            return;
+        }
     }
 #endif
 

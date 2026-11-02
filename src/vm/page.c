@@ -202,7 +202,11 @@ handle_mm_fault (struct page *p)
   if (kpage == NULL)
     return false;
 
-  if (p->type == PAGE_BIN)
+  /* [3-4-1] Memory Mapped Files : mmap 페이지도 파일에서 읽기
+     변경 내용 : PAGE_BIN 에 더해 PAGE_MMAP 도 file_read_at () 로 채운다
+     변경 이유 : mmap 페이지는 처음 접근할 때 매핑된 파일에서 지연 적재한다 (매뉴얼 4.3.4)
+     영향 범위 : handle_mm_fault () 의 내용 채우기 분기 */
+  if (p->type == PAGE_BIN || p->type == PAGE_MMAP)
     {
       off_t n;
 
@@ -220,6 +224,12 @@ handle_mm_fault (struct page *p)
   else
     memset (kpage, 0, PGSIZE);
 
+  /* [3-4-1] Memory Mapped Files : swap 에서 돌아오는지 기억
+     변경 내용 : swap_in 블록 전에 swap_slot 이 있었는지를 from_swap 에 담아 둔다
+     변경 이유 : swap_in 블록이 swap_slot 을 지우므로 매핑 뒤에 dirty 표시를 되살릴 때 쓰기 위해
+     영향 범위 : handle_mm_fault () 의 지역 변수 */
+  bool from_swap = p->swap_slot != PAGE_NO_SLOT;
+
   /* [3-2-2] Eviction : swap 에 있는 페이지 읽기
      변경 내용 : swap_slot 이 있으면 swap_in () 으로 내용을 덮고 슬롯을 PAGE_NO_SLOT 으로 되돌린다
      변경 이유 : eviction 이 PAGE_ANON 으로 바꿔 둔 페이지는 위에서 0 으로만 채워지므로 여기서 swap 내용으로 덮는다 (매뉴얼 4.1.6)
@@ -236,6 +246,14 @@ handle_mm_fault (struct page *p)
       frame_free (kpage);
       return false;
     }
+
+  /* [3-4-1] Memory Mapped Files : swap 에서 돌아온 mmap 페이지의 dirty 복원
+     변경 내용 : mmap 페이지가 swap 에서 돌아왔으면 사용자 PTE 의 D 비트를 켠다
+     변경 이유 : swap 에서 돌아온 mmap 페이지는 커널 주소로 채워 사용자 PTE 의 D 비트가 0 이므로
+                 파일과 다르다는 표시를 되살린다, 그래야 munmap · 종료 때 파일에 쓴다
+     영향 범위 : handle_mm_fault () 의 매핑 직후 */
+  if (p->type == PAGE_MMAP && from_swap)
+    pagedir_set_dirty (thread_current ()->pagedir, p->upage, true);
 
   p->kpage = kpage;
   /* [3-2-2] Eviction : 적재가 끝난 frame 연결
@@ -260,4 +278,143 @@ page_pin (struct page *p)
     if (!handle_mm_fault (p))
       return false;
   return true;
+}
+
+/* [3-3-1] 스택 접근 판정
+   목적 : SPT 에 없는 주소가 스택을 늘려야 하는 접근인지 판정한다
+   입력 : addr - fault 가 난 주소 또는 시스템 콜이 닿는 주소
+          esp  - 사용자 스택 포인터
+   출력 : 스택 접근이면 true
+   참고 : Pintos manual 4.3.3, 조교 슬라이드 11 · 14 · 15 · 16
+   주의 : PUSH 는 esp - 4, PUSHA 는 esp - 32 에서 fault 를 낼 수 있어 esp - 32 까지 허용한다, esp - 32 보다 아래는 스택 접근으로 보지 않는다 (pt-grow-bad)
+          사용자 주소이고 PHYS_BASE - STACK_LIMIT 이상이어야 한다 */
+bool
+page_is_stack_access (const void *addr, const void *esp)
+{
+  return is_user_vaddr (addr)
+         && (const uint8_t *) addr >= (const uint8_t *) PHYS_BASE - STACK_LIMIT
+         && (const uint8_t *) addr >= (const uint8_t *) esp - 32;
+}
+
+/* [3-3-1] 스택 늘리기
+   목적 : 주소가 속한 페이지에 PAGE_ANON 항목을 만들어 적재한다
+   입력 : addr - 스택 접근으로 판정된 주소
+   출력 : 성공하면 true, 항목 생성이나 적재에 실패하면 false
+   참고 : Pintos manual 4.3.3, 조교 슬라이드 11 · 14 · 15 · 16
+   주의 : fault 가 난 페이지 하나만 붙인다, 그 사이 페이지는 접근할 때 따로 붙는다 (조교 슬라이드 16), 줄이는 처리는 하지 않는다
+          적재에 실패해도 항목은 Spt 에 남지만 프로세스가 곧 끝나 page_table_destroy () 가 해제한다
+          Filesys_lock 을 잡지 않은 상태에서만 부른다 */
+bool
+page_grow_stack (void *addr)
+{
+  struct page *p = page_add_anon (pg_round_down (addr), true);
+  if (p == NULL)
+    return false;
+  return handle_mm_fault (p);
+}
+
+/* [3-4-1] mmap 페이지 항목 추가
+   목적 : mmap 한 파일의 페이지 하나를 현재 프로세스의 Spt 에 기록한다
+   입력 : upage - 사용자 가상 페이지 (페이지 정렬)
+          file, ofs - 매핑된 파일과 이 페이지가 시작하는 파일 위치
+          read_bytes, zero_bytes - 파일에서 읽을 바이트 수와 0 으로 채울 바이트 수
+   출력 : 만든 항목, malloc 실패나 같은 upage 가 이미 있으면 NULL
+   참고 : Pintos manual 4.1.7, 4.3.4
+   주의 : 항상 쓰기 가능한 페이지로 만든다, kpage 는 NULL 로 두고 처음 접근할 때 handle_mm_fault () 가 채운다 */
+struct page *
+page_add_mmap (void *upage, struct file *file, off_t ofs,
+               uint32_t read_bytes, uint32_t zero_bytes)
+{
+  struct page *p;
+
+  ASSERT (pg_ofs (upage) == 0);
+
+  p = malloc (sizeof *p);
+  if (p == NULL)
+    return NULL;
+
+  p->upage = upage;
+  p->kpage = NULL;
+  p->type = PAGE_MMAP;
+  p->writable = true;
+  p->file = file;
+  p->ofs = ofs;
+  p->read_bytes = read_bytes;
+  p->zero_bytes = zero_bytes;
+  p->swap_slot = PAGE_NO_SLOT;
+
+  if (hash_insert (&thread_current ()->Spt, &p->elem) != NULL)
+    {
+      free (p);
+      return NULL;
+    }
+  return p;
+}
+
+/* [3-4-1] 매핑 하나 해제
+   목적 : 매핑의 모든 페이지를 내리고 쓰인 페이지는 파일에 쓴 뒤 매핑 정보를 없앤다
+   입력 : m - 현재 스레드의 매핑
+   출력 : 없음
+   참고 : Pintos manual 4.1.7, 4.3.4
+   주의 : 쓰인 페이지만 파일에 쓴다, read_bytes 까지만 쓰고 끝 페이지의 남는 부분은 버린다 (매뉴얼 4.3.4)
+          page_pin () 으로 고정한 frame 에 대해서만 frame_free () 를 부른다
+          Filesys_lock 은 파일 함수 둘레에서만 잡고 그 안에서 page_pin () 이나 frame 함수를 부르지 않는다
+          현재 스레드의 매핑만 다룬다 */
+void
+page_unmap (struct mmap_file *m)
+{
+  struct thread *t = thread_current ();
+  size_t i;
+
+  for (i = 0; i < m->page_cnt; i++)
+    {
+      uint8_t *upage = (uint8_t *) m->addr + i * PGSIZE;
+      struct page *p = page_find (&t->Spt, upage);
+
+      if (p == NULL)
+        continue;
+
+      if (page_pin (p))
+        {
+          void *kpage;
+
+          if (pagedir_is_dirty (t->pagedir, upage))
+            {
+              lock_acquire (&Filesys_lock);
+              file_write_at (m->file, p->kpage, p->read_bytes, p->ofs);
+              lock_release (&Filesys_lock);
+            }
+          kpage = p->kpage;
+          pagedir_clear_page (t->pagedir, upage);
+          p->kpage = NULL;
+          frame_free (kpage);
+        }
+
+      hash_delete (&t->Spt, &p->elem);
+      if (p->swap_slot != PAGE_NO_SLOT)
+        swap_free (p->swap_slot);
+      free (p);
+    }
+
+  lock_acquire (&Filesys_lock);
+  file_close (m->file);
+  lock_release (&Filesys_lock);
+
+  list_remove (&m->elem);
+  free (m);
+}
+
+/* [3-4-1] 모든 매핑 해제
+   목적 : 프로세스가 끝날 때 남은 매핑을 모두 내리고 dirty 페이지를 파일에 쓴다
+   입력 : 없음
+   출력 : 없음
+   참고 : Pintos manual 4.1.7, 4.3.4
+   주의 : process_exit () 에서 frame_remove_owner () 보다 먼저, pagedir 가 살아 있고 Filesys_lock 을 잡지 않은 위치에서 부른다 */
+void
+page_unmap_all (void)
+{
+  struct thread *t = thread_current ();
+
+  while (!list_empty (&t->Mmap_list))
+    page_unmap (list_entry (list_front (&t->Mmap_list), struct mmap_file, elem));
 }

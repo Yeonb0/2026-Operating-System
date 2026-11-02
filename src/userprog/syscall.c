@@ -43,6 +43,15 @@
 #include "vm/frame.h"
 #endif
 
+/* [3-4-1] Memory Mapped Files : mmap 에 필요한 헤더 추가
+   변경 내용 : VM 빌드에서 DIV_ROUND_UP 을 위해 round.h 를, struct mmap_file 을 만들기 위해 threads/malloc.h 를 include 한다
+   변경 이유 : 파일 길이로 매핑할 페이지 수를 구하고 매핑 정보를 malloc 하기 위해 (매뉴얼 4.3.4)
+   영향 범위 : syscall.c 의 include 만, VM 빌드만 */
+#ifdef VM
+#include <round.h>
+#include "threads/malloc.h"
+#endif
+
 /* [1-2-2] create, remove 구현에 필요한 헤더 추가
    목적 : filesys_create() 와 filesys_remove() 를 호출한다
    참고 : proj1 슬라이드 71 - filesys/filesys.h 의 API 를 사용하라는 안내
@@ -151,6 +160,18 @@ check_address (const void *addr, unsigned size)
 #ifdef VM
     {
       struct page *p = page_find (&t->Spt, page);
+      /* [3-3-1] Stack Growth : check_address 의 스택 확장
+         변경 내용 : 항목이 없는 페이지가 스택 접근이면 page_grow_stack () 으로 붙이고 다시 찾는다
+                     판정은 그 페이지 안에서 검사 범위가 시작하는 실제 주소로 한다
+         변경 이유 : 시스템 콜 안에서 처음 닿는 스택 버퍼도 lock 을 잡기 전에 늘린다 (pt-grow-stk-sc)
+         영향 범위 : check_address () 의 VM 블록, VM 빌드만 */
+      if (p == NULL)
+        {
+          const uint8_t *a = page < begin ? begin : page;
+          if (page_is_stack_access (a, t->user_esp)
+              && page_grow_stack ((void *) a))
+            p = page_find (&t->Spt, page);
+        }
       if (p == NULL)
         exit (-1);
       if (p->kpage == NULL && !handle_mm_fault (p))
@@ -737,6 +758,104 @@ tell (int fd)
   return position;
 }
 
+/* [3-4-1] mmap 시스템 콜 : 파일을 메모리에 매핑
+   목적 : fd 의 파일을 addr 부터 페이지 단위로 지연 적재되도록 매핑한다
+   입력 : fd   - 매핑할 파일 디스크립터
+          addr - 매핑 시작 주소
+   출력 : 매핑 번호, 실패하면 -1
+   참고 : Pintos manual 4.1.7, 4.3.4
+   주의 : fd 0 · 1, 길이 0, addr 0 · 비정렬, 기존 페이지와 겹침이면 실패, file_reopen 으로 독립 참조를 얻어 close · remove 뒤에도 매핑이 유효하다 (매뉴얼 4.3.4)
+          addr 를 역참조하지 않으므로 check_address () 를 부르지 않는다
+          Filesys_lock 은 파일 함수 둘레에서만 잡는다 */
+#ifdef VM
+int
+mmap (int fd, void *addr)
+{
+  struct thread *t = thread_current ();
+  struct file *File = get_file (fd);
+  struct file *Reopened;
+  struct mmap_file *m;
+  off_t len;
+  size_t page_cnt;
+  size_t i;
+
+  if (File == NULL || addr == NULL || pg_ofs (addr) != 0)
+    return -1;
+
+  lock_acquire (&Filesys_lock);
+  Reopened = file_reopen (File);
+  len = Reopened != NULL ? file_length (Reopened) : 0;
+  lock_release (&Filesys_lock);
+  if (Reopened == NULL)
+    return -1;
+  if (len == 0)
+    goto fail;
+
+  page_cnt = DIV_ROUND_UP (len, PGSIZE);
+  for (i = 0; i < page_cnt; i++)
+    {
+      uint8_t *upage = (uint8_t *) addr + i * PGSIZE;
+      if (!is_user_vaddr (upage) || page_find (&t->Spt, upage) != NULL)
+        goto fail;
+    }
+
+  m = malloc (sizeof *m);
+  if (m == NULL)
+    goto fail;
+  m->mapid = t->next_mapid++;
+  m->file = Reopened;
+  m->addr = addr;
+  m->page_cnt = 0;
+  list_push_back (&t->Mmap_list, &m->elem);
+
+  for (i = 0; i < page_cnt; i++)
+    {
+      uint8_t *upage = (uint8_t *) addr + i * PGSIZE;
+      off_t remain = len - i * PGSIZE;
+      uint32_t read_bytes = remain < PGSIZE ? remain : PGSIZE;
+
+      if (page_add_mmap (upage, Reopened, i * PGSIZE, read_bytes,
+                         PGSIZE - read_bytes) == NULL)
+        {
+          page_unmap (m);
+          return -1;
+        }
+      m->page_cnt++;
+    }
+  return m->mapid;
+
+ fail:
+  lock_acquire (&Filesys_lock);
+  file_close (Reopened);
+  lock_release (&Filesys_lock);
+  return -1;
+}
+
+/* [3-4-1] munmap 시스템 콜 : 매핑 해제
+   목적 : mapid 의 매핑을 내리고 쓰인 페이지를 파일에 쓴다
+   입력 : mapid - mmap () 이 돌려준 매핑 번호
+   출력 : 없음
+   참고 : Pintos manual 4.1.7, 4.3.4
+   주의 : 현재 스레드의 매핑만 찾고 없는 번호는 조용히 무시한다 */
+void
+munmap (int mapid)
+{
+  struct thread *t = thread_current ();
+  struct list_elem *e;
+
+  for (e = list_begin (&t->Mmap_list); e != list_end (&t->Mmap_list);
+       e = list_next (e))
+    {
+      struct mmap_file *m = list_entry (e, struct mmap_file, elem);
+      if (m->mapid == mapid)
+        {
+          page_unmap (m);
+          return;
+        }
+    }
+}
+#endif
+
 /* [1-1-3] 수정 : 시스템 콜 진입 시 스택 포인터부터 검증
    변경 내용 : 기존 골격 앞에 check_address() 호출을 추가해
               f->esp 가 가리키는 4바이트(시스템 콜 번호)의 유효성을 먼저 확인
@@ -817,6 +936,13 @@ syscall_handler (struct intr_frame *f)
   int syscall_number;
   int Arg[4];
 
+  /* [3-3-1] Stack Growth : 시스템 콜 진입 시 사용자 esp 저장
+     변경 내용 : check_address () 보다 먼저 현재 스레드의 user_esp 에 f->esp 를 저장한다
+     변경 이유 : 커널 문맥에서 스택 접근을 판정할 사용자 esp 를 시스템 콜 진입 때 저장한다 (매뉴얼 4.3.3)
+     영향 범위 : syscall_handler () 의 첫머리, VM 빌드만 */
+#ifdef VM
+  thread_current ()->user_esp = f->esp;
+#endif
   check_address (f->esp, sizeof (int));
   syscall_number = * (int *) f->esp;
 
@@ -895,6 +1021,22 @@ syscall_handler (struct intr_frame *f)
       get_argument (f->esp, Arg, 4);
       f->eax = max_of_four_int (Arg[0], Arg[1], Arg[2], Arg[3]);
       break;
+
+    /* [3-4-1] Memory Mapped Files : SYS_MMAP, SYS_MUNMAP 분기
+       변경 내용 : VM 빌드에서 두 case 를 추가하고 mmap 의 반환값을 f->eax 에 담는다
+       변경 이유 : mmap · munmap 시스템 콜을 처리하기 위해 (매뉴얼 4.3.4)
+       영향 범위 : switch 의 default 앞, VM 빌드만 */
+#ifdef VM
+    case SYS_MMAP:
+      get_argument (f->esp, Arg, 2);
+      f->eax = mmap (Arg[0], (void *) Arg[1]);
+      break;
+
+    case SYS_MUNMAP:
+      get_argument (f->esp, Arg, 1);
+      munmap (Arg[0]);
+      break;
+#endif
 
     default:
       /* 아직 지원하지 않는 시스템 콜 번호는 잘못된 요청으로 본다 */

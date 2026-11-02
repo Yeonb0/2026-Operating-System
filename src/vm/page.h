@@ -2,6 +2,7 @@
 #define VM_PAGE_H
 
 #include <hash.h>
+#include <list.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include "filesys/off_t.h"
@@ -16,6 +17,14 @@ struct file;
    주의 : 실제 슬롯 번호는 이 값보다 항상 작다 */
 #define PAGE_NO_SLOT SIZE_MAX
 
+/* [3-3-1] Stack Growth : 스택 최대 크기
+   목적 : 스택이 자랄 수 있는 한계를 PHYS_BASE 아래로 정한다
+   입력 : 없음
+   출력 : 8MB
+   참고 : Pintos manual 4.3.3, 조교 슬라이드 11 · 14 · 15 · 16
+   주의 : PHYS_BASE - STACK_LIMIT 보다 아래 주소는 스택 접근으로 보지 않는다 */
+#define STACK_LIMIT (8 * 1024 * 1024)
+
 /* [3-1-2] Supplemental Page Table : 페이지 종류
    목적 : 사용자 가상 페이지의 내용이 어디서 오는지 구분한다
    입력 : 없음
@@ -26,6 +35,11 @@ struct file;
 enum page_type
   {
     PAGE_BIN,     /* 실행 파일 세그먼트 : file 의 ofs 에서 read_bytes 읽고 zero_bytes 를 0 으로 */
+    /* [3-4-1] Memory Mapped Files : mmap 페이지 종류 추가
+       변경 내용 : enum page_type 에 PAGE_MMAP 을 추가한다
+       변경 이유 : mmap 으로 매핑한 파일 페이지를 실행 파일 페이지와 구분하기 위해 (매뉴얼 4.3.4)
+       영향 범위 : PAGE_BIN 과 PAGE_ANON 사이에 끼워 PAGE_ANON 의 값이 1 에서 2 로 바뀐다, 열거값 숫자에 의존하는 코드는 없다 */
+    PAGE_MMAP,    /* mmap 페이지 : file 의 ofs 에서 read_bytes 읽고 나머지 0, 원본은 매핑된 파일 */
     PAGE_ANON     /* 파일 원본이 없는 페이지 : 스택 */
   };
 
@@ -62,5 +76,27 @@ struct page *page_add_anon (void *upage, bool writable);
 struct page *page_find (struct hash *spt, const void *vaddr);
 bool handle_mm_fault (struct page *p);
 bool page_pin (struct page *p);
+bool page_is_stack_access (const void *addr, const void *esp);
+bool page_grow_stack (void *addr);
+
+/* [3-4-1] Memory Mapped Files : 매핑 하나의 정보
+   목적 : mmap () 한 번으로 만든 매핑의 번호, 파일, 주소 범위를 기록한다
+   입력 : mmap () 이 채운다
+   출력 : 프로세스별 Mmap_list 의 원소
+   참고 : Pintos manual 4.1.7, 4.3.4
+   주의 : file 은 file_reopen () 으로 얻은 독립 참조라 close · remove 뒤에도 매핑이 유효하다
+          addr 은 페이지 정렬된 주소이고 page_cnt 는 실제로 만든 페이지 수다 */
+struct mmap_file
+  {
+    int mapid;                /* 매핑 번호, 프로세스 안에서 유일 */
+    struct file *file;        /* file_reopen () 으로 얻은 독립 참조 */
+    void *addr;               /* 매핑 시작 주소 (페이지 정렬) */
+    size_t page_cnt;          /* 매핑한 페이지 수 */
+    struct list_elem elem;    /* Mmap_list 의 원소 */
+  };
+
+struct page *page_add_mmap (void *upage, struct file *file, off_t ofs, uint32_t read_bytes, uint32_t zero_bytes);
+void page_unmap (struct mmap_file *m);
+void page_unmap_all (void);
 
 #endif /* vm/page.h */

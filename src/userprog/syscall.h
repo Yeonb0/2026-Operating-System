@@ -89,4 +89,13 @@ unsigned tell (int fd);
           사용자 포인터 검증은 반드시 락 밖에서 끝내야 한다 */
 extern struct lock Filesys_lock;
 
+/* [3-4-1] Memory Mapped Files : mmap, munmap 시스템 콜 선언
+   목적 : mmap 과 munmap 의 프로토타입을 공개한다
+   참고 : Pintos manual 4.1.7, 4.3.4
+   주의 : VM 빌드에서만 존재한다 */
+#ifdef VM
+int mmap (int fd, void *addr);
+void munmap (int mapid);
+#endif
+
 #endif /* userprog/syscall.h */

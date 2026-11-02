@@ -101,7 +101,15 @@ frame_evict (enum palloc_flags flags)
   if (p->type == PAGE_ANON || pagedir_is_dirty (t->pagedir, p->upage))
     {
       p->swap_slot = swap_out (kpage);
-      p->type = PAGE_ANON;
+      /* [3-4-1] Memory Mapped Files : dirty mmap 페이지는 PAGE_MMAP 으로 남긴다
+         변경 내용 : swap 에 쓴 뒤 PAGE_BIN 만 PAGE_ANON 으로 바꾸고 PAGE_MMAP 은 그대로 둔다
+         변경 이유 : dirty mmap 페이지는 eviction 때 파일 대신 swap 에 보관하고 munmap · 종료 때 파일에 쓴다,
+                     eviction 에서 파일에 쓰면 Frame_lock 을 잡은 채 Filesys_lock 을 잡게 되어
+                     load () 의 Filesys_lock → Frame_lock 순서와 교착한다
+                     (매뉴얼 4.3.4 와 다른 점, 지침 7.1)
+         영향 범위 : frame_evict () 의 내보내기 분기, 깨끗한 PAGE_MMAP 은 버리고 다음 fault 에서 파일에서 다시 읽는다 */
+      if (p->type == PAGE_BIN)
+        p->type = PAGE_ANON;
     }
 
   lock_release (&Frame_lock);

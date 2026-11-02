@@ -226,6 +226,19 @@ struct thread
        주의 : pagedir 가 NULL 이 아니면 Spt 가 초기화되어 있다 */
 #ifdef VM
     struct hash Spt;                    /* Supplemental page table */
+    /* [3-3-1] Stack Growth : 시스템 콜 진입 시 사용자 esp 필드
+       변경 내용 : VM 빌드에서 struct thread 에 user_esp 를 추가한다
+       변경 이유 : 커널 문맥의 fault 에서는 f->esp 가 사용자 esp 가 아니므로
+                   syscall_handler () 가 진입 때 저장한 값으로 스택 접근을 판정한다 (매뉴얼 4.3.3)
+       영향 범위 : VM 빌드의 struct thread 크기, 다른 빌드는 변화 없음 */
+    void *user_esp;                     /* 시스템 콜 진입 시 사용자 esp */
+    /* [3-4-1] Memory Mapped Files : 프로세스별 mmap 목록 필드
+       변경 내용 : VM 빌드에서 struct thread 에 Mmap_list 와 next_mapid 를 추가한다
+       변경 이유 : mmap 으로 만든 매핑을 번호로 찾아 munmap 하고 종료 때 모두 내리기 위해 (매뉴얼 4.3.4)
+       영향 범위 : VM 빌드의 struct thread 크기, 다른 빌드는 변화 없음
+       주의 : load () 가 pagedir 생성 직후 초기화한다, pagedir 가 NULL 이 아니면 초기화되어 있다 */
+    struct list Mmap_list;              /* mmap 매핑 목록 */
+    int next_mapid;                     /* 다음에 줄 매핑 번호 */
 #endif
 #endif
 

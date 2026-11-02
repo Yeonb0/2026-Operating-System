@@ -370,6 +370,15 @@ process_exit (void)
                 이 함수 자체가 호출되지 않으므로 별도 분기가 필요 없다 */
       printf ("%s: exit(%d)\n", cur->name, cur->exit_status);
 
+      /* [3-4-1] Memory Mapped Files : 종료 프로세스의 매핑 해제
+         변경 내용 : frame 정리 전에 page_unmap_all () 로 남은 매핑을 내리고 dirty 페이지를 파일에 쓴다
+         변경 이유 : 종료 때 쓰인 mmap 페이지가 파일에 반영되어야 한다 (매뉴얼 4.3.4)
+                     pagedir 가 아직 살아 있고 Filesys_lock 을 잡지 않은 위치다
+         영향 범위 : process_exit () 의 pd != NULL 블록, VM 빌드만 */
+#ifdef VM
+      page_unmap_all ();
+#endif
+
       /* [3-1-1] Frame Table : 종료 프로세스의 frame 항목 제거
          변경 내용 : pagedir_destroy () 직전에 frame_remove_owner (cur) 를 부른다
          변경 이유 : 사용자 frame 을 frame table 로 관리하기 위해 (매뉴얼 4.2 1단계)
@@ -558,6 +567,15 @@ load (const char *file_name, void (**eip) (void), void **esp)
       t->pagedir = NULL;
       goto done;
     }
+#endif
+  /* [3-4-1] Memory Mapped Files : load 의 mmap 목록 초기화
+     변경 내용 : Spt 초기화 직후 Mmap_list 를 비우고 next_mapid 를 1 로 둔다
+     변경 이유 : pagedir 가 NULL 이 아니면 Mmap_list 가 초기화되어 있다는 관계를 지켜
+                 process_exit () 이 pd != NULL 블록에서 매핑을 내리게 한다 (매뉴얼 4.3.4)
+     영향 범위 : load () 의 pagedir 생성 직후, VM 빌드만 */
+#ifdef VM
+  list_init (&t->Mmap_list);
+  t->next_mapid = 1;
 #endif
   process_activate ();
 
