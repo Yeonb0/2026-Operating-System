@@ -8,6 +8,7 @@
 #include "userprog/pagedir.h"
 #include "userprog/syscall.h"
 #include "vm/frame.h"
+#include "vm/swap.h"
 
 /* [3-1-2] Supplemental Page Table : 해시 함수
    목적 : struct page 의 upage 를 키로 해시 값을 만든다
@@ -46,6 +47,13 @@ page_less (const struct hash_elem *a, const struct hash_elem *b,
 static void
 page_destructor (struct hash_elem *e, void *aux UNUSED)
 {
+  /* [3-2-2] Eviction : swap 에 남은 슬롯 해제
+     변경 내용 : 메모리에 없고 swap 슬롯이 있는 항목은 free 하기 전에 슬롯을 비운다
+     변경 이유 : 프로세스가 끝날 때 swap 에 남은 페이지의 슬롯이 새지 않게 하기 위해 (매뉴얼 4.1.6)
+     영향 범위 : page_destructor () 의 첫머리 */
+  struct page *p = hash_entry (e, struct page, elem);
+  if (p->kpage == NULL && p->swap_slot != PAGE_NO_SLOT)
+    swap_free (p->swap_slot);
   free (hash_entry (e, struct page, elem));
 }
 
@@ -102,6 +110,11 @@ page_add_file (void *upage, struct file *file, off_t ofs,
   p->ofs = ofs;
   p->read_bytes = read_bytes;
   p->zero_bytes = zero_bytes;
+  /* [3-2-2] Eviction : swap 슬롯 초기값
+     변경 내용 : swap_slot 을 PAGE_NO_SLOT 으로 둔다
+     변경 이유 : 새 항목은 swap 에 없다 (매뉴얼 4.1.6)
+     영향 범위 : page_add_file () 가 만드는 항목 */
+  p->swap_slot = PAGE_NO_SLOT;
 
   if (hash_insert (&thread_current ()->Spt, &p->elem) != NULL)
     {
@@ -137,6 +150,11 @@ page_add_anon (void *upage, bool writable)
   p->ofs = 0;
   p->read_bytes = 0;
   p->zero_bytes = PGSIZE;
+  /* [3-2-2] Eviction : swap 슬롯 초기값
+     변경 내용 : swap_slot 을 PAGE_NO_SLOT 으로 둔다
+     변경 이유 : 새 항목은 swap 에 없다 (매뉴얼 4.1.6)
+     영향 범위 : page_add_anon () 가 만드는 항목 */
+  p->swap_slot = PAGE_NO_SLOT;
 
   if (hash_insert (&thread_current ()->Spt, &p->elem) != NULL)
     {
@@ -202,6 +220,16 @@ handle_mm_fault (struct page *p)
   else
     memset (kpage, 0, PGSIZE);
 
+  /* [3-2-2] Eviction : swap 에 있는 페이지 읽기
+     변경 내용 : swap_slot 이 있으면 swap_in () 으로 내용을 덮고 슬롯을 PAGE_NO_SLOT 으로 되돌린다
+     변경 이유 : eviction 이 PAGE_ANON 으로 바꿔 둔 페이지는 위에서 0 으로만 채워지므로 여기서 swap 내용으로 덮는다 (매뉴얼 4.1.6)
+     영향 범위 : handle_mm_fault () 의 내용 채우기 직후 */
+  if (p->swap_slot != PAGE_NO_SLOT)
+    {
+      swap_in (p->swap_slot, kpage);
+      p->swap_slot = PAGE_NO_SLOT;
+    }
+
   if (!pagedir_set_page (thread_current ()->pagedir, p->upage, kpage,
                          p->writable))
     {
@@ -210,5 +238,26 @@ handle_mm_fault (struct page *p)
     }
 
   p->kpage = kpage;
+  /* [3-2-2] Eviction : 적재가 끝난 frame 연결
+     변경 내용 : p->kpage 를 채운 뒤 frame_install () 로 frame 에 항목을 연결하고 eviction 대상으로 푼다
+     변경 이유 : 적재 중인 frame 은 pinned 로 보호하고 끝난 뒤에 풀기 위해 (매뉴얼 4.3.5)
+     영향 범위 : handle_mm_fault () 의 성공 경로 */
+  frame_install (kpage, p);
+  return true;
+}
+
+/* [3-2-2] 페이지를 메모리에 올려 고정
+   목적 : 페이지를 메모리에 올리고 그 frame 을 pinned 로 한다
+   입력 : p - 고정할 SPT 항목
+   출력 : 성공하면 true, 적재에 실패하면 false
+   참고 : Pintos manual 4.3.5 (pinning)
+   주의 : 올린 직후 다른 프로세스의 eviction 이 끼어들어 내보냈을 수 있어 고정에 성공할 때까지 되풀이한다
+          Filesys_lock 을 잡지 않은 상태에서만 부른다 */
+bool
+page_pin (struct page *p)
+{
+  while (!frame_pin_resident (p))
+    if (!handle_mm_fault (p))
+      return false;
   return true;
 }

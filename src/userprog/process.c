@@ -898,6 +898,14 @@ setup_stack (void **esp)
   if (success)
     p->kpage = kpage;
 #endif
+  /* [3-2-2] Eviction : 첫 스택 frame 연결
+     변경 내용 : 스택 페이지 적재에 성공하면 frame_install () 로 frame 에 항목을 연결한다
+     변경 이유 : 연결되기 전의 frame 은 pinned 라 eviction 대상이 아니므로 연결해서 대상으로 풀기 위해 (매뉴얼 4.3.5)
+     영향 범위 : setup_stack () 의 반환 직전, VM 빌드만 */
+#ifdef VM
+  if (success)
+    frame_install (kpage, p);
+#endif
   return success;
 }
 

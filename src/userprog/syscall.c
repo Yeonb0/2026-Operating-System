@@ -36,6 +36,11 @@
    영향 범위 : syscall.c 의 include 만, VM 빌드만 */
 #ifdef VM
 #include "vm/page.h"
+/* [3-2-2] Eviction : syscall_handler 의 pin 해제에 필요한 헤더 추가
+   변경 내용 : VM 빌드에서 frame_unpin_owner () 를 위해 vm/frame.h 를 include 한다
+   변경 이유 : 시스템 콜이 끝나면 그 프로세스의 frame 을 eviction 대상으로 다시 풀기 위해 (매뉴얼 4.3.5)
+   영향 범위 : syscall.c 의 include 만, VM 빌드만 */
+#include "vm/frame.h"
 #endif
 
 /* [1-2-2] create, remove 구현에 필요한 헤더 추가
@@ -149,6 +154,13 @@ check_address (const void *addr, unsigned size)
       if (p == NULL)
         exit (-1);
       if (p->kpage == NULL && !handle_mm_fault (p))
+        exit (-1);
+      /* [3-2-2] Eviction : 시스템 콜이 쓸 페이지 고정
+         변경 내용 : 올라온 페이지의 frame 을 page_pin () 으로 pinned 로 한다
+         변경 이유 : 시스템 콜이 끝날 때까지 커널이 쓰는 사용자 페이지가 내보내지지 않게 한다 (매뉴얼 4.3.5)
+                     고정은 syscall_handler () 가 끝날 때 한꺼번에 푼다
+         영향 범위 : check_address () 의 VM 블록, VM 빌드만 */
+      if (!page_pin (p))
         exit (-1);
     }
 #else
@@ -889,4 +901,12 @@ syscall_handler (struct intr_frame *f)
       exit (-1);
       break;
     }
+
+  /* [3-2-2] Eviction : 시스템 콜 뒤 pin 해제
+     변경 내용 : switch 가 끝나면 frame_unpin_owner () 로 이 프로세스의 frame 고정을 모두 푼다
+     변경 이유 : check_address () 가 고정한 페이지를 시스템 콜이 끝난 뒤 eviction 대상으로 되돌리기 위해 (매뉴얼 4.3.5)
+     영향 범위 : syscall_handler () 의 마지막, VM 빌드만 */
+#ifdef VM
+  frame_unpin_owner (thread_current ());
+#endif
 }

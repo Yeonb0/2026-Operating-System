@@ -69,6 +69,9 @@ vm_SRC  = vm/frame.c		# Frame table.
 # [3-1-2] Supplemental Page Table : vm 빌드에서 SPT 소스를 컴파일한다
 #   참고 : 조교 슬라이드 8 · 17
 vm_SRC += vm/page.c		# Supplemental page table.
+# [3-2-1] Swap Table : vm 빌드에서 swap table 소스를 컴파일한다
+#   참고 : 조교 슬라이드 13 · 17
+vm_SRC += vm/swap.c		# Swap table.
 
 # Filesystem code.
 filesys_SRC  = filesys/filesys.c	# Filesystem core.

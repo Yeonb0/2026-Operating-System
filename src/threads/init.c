@@ -38,6 +38,11 @@
    영향 범위 : VM 빌드의 init.c 만, 다른 빌드는 변화 없음 */
 #ifdef VM
 #include "vm/frame.h"
+/* [3-2-1] Swap Table : vm/swap.h 포함
+   변경 내용 : VM 빌드에서 vm/swap.h 를 include 한다
+   변경 이유 : swap_init () 을 부르기 위해 (매뉴얼 4.1.6)
+   영향 범위 : VM 빌드의 init.c 만, 다른 빌드는 변화 없음 */
+#include "vm/swap.h"
 #endif
 #ifdef FILESYS
 #include "devices/block.h"
@@ -141,6 +146,14 @@ main (void)
   ide_init ();
   locate_block_devices ();
   filesys_init (format_filesys);
+  /* [3-2-1] Swap Table : swap table 초기화
+     변경 내용 : filesys_init () 다음에 swap_init () 을 부른다
+     변경 이유 : swap 장치는 locate_block_devices () 뒤에야 block_get_role (BLOCK_SWAP) 으로 얻을 수 있다
+                 (조교 슬라이드 13 : devices/partition.c, threads/init.c 참조)
+     영향 범위 : VM 빌드의 부팅 순서만, 다른 빌드는 변화 없음 */
+#ifdef VM
+  swap_init ();
+#endif
 #endif
 
   printf ("Boot complete.\n");
