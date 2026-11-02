@@ -24,6 +24,20 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+/* [3-1-1] Frame Table : vm/frame.h 포함
+   변경 내용 : VM 빌드에서 vm/frame.h 를 include 한다
+   변경 이유 : 사용자 frame 을 frame table 로 관리하기 위해 (매뉴얼 4.2 1단계)
+               userprog 빌드는 vm/ 의 .c 파일을 컴파일하지 않으므로 #else 에 원본 유지
+   영향 범위 : process.c 의 include 만 */
+#ifdef VM
+#include "vm/frame.h"
+/* [3-1-2] Supplemental Page Table : vm/page.h 포함
+   변경 내용 : VM 빌드에서 vm/page.h 를 include 한다
+   변경 이유 : 프로세스별 보조 페이지 테이블에 페이지 항목을 기록하기 위해 (매뉴얼 4.1.4)
+               userprog 빌드는 vm/ 의 .c 파일을 컴파일하지 않으므로 #ifdef VM 으로 감싼다
+   영향 범위 : process.c 의 include 만 */
+#include "vm/page.h"
+#endif
 
 /* [1-1-2] Argument Passing : 명령행 처리 한계값
    목적 : 명령행 사본 버퍼와 argv 배열의 크기를 한곳에서 관리한다
@@ -356,6 +370,24 @@ process_exit (void)
                 이 함수 자체가 호출되지 않으므로 별도 분기가 필요 없다 */
       printf ("%s: exit(%d)\n", cur->name, cur->exit_status);
 
+      /* [3-1-1] Frame Table : 종료 프로세스의 frame 항목 제거
+         변경 내용 : pagedir_destroy () 직전에 frame_remove_owner (cur) 를 부른다
+         변경 이유 : 사용자 frame 을 frame table 로 관리하기 위해 (매뉴얼 4.2 1단계)
+                     물리 페이지는 pagedir_destroy () 가 해제하므로 항목만 제거한다
+         영향 범위 : process_exit () 의 pd != NULL 블록, VM 빌드만 */
+#ifdef VM
+      frame_remove_owner (cur);
+#endif
+
+      /* [3-1-2] Supplemental Page Table : 종료 프로세스의 Spt 해제
+         변경 내용 : frame_remove_owner () 다음에 page_table_destroy (&cur->Spt) 를 부른다
+         변경 이유 : pagedir 가 NULL 이 아니면 Spt 가 초기화되어 있으므로
+                     pd != NULL 블록 안에서 항목과 buckets 를 free 한다
+         영향 범위 : process_exit () 의 pd != NULL 블록, VM 빌드만 */
+#ifdef VM
+      page_table_destroy (&cur->Spt);
+#endif
+
       /* Correct ordering here is crucial.  We must set
          cur->pagedir to NULL before switching page directories,
          so that a timer interrupt can't switch back to the
@@ -512,6 +544,21 @@ load (const char *file_name, void (**eip) (void), void **esp)
   t->pagedir = pagedir_create ();
   if (t->pagedir == NULL) 
     goto done;
+  /* [3-1-2] Supplemental Page Table : load 의 Spt 초기화
+     변경 내용 : pagedir_create () 성공 직후 page_table_init (&t->Spt) 를 부르고,
+                 실패하면 pagedir 를 해제하고 NULL 로 되돌린 뒤 done 으로 간다
+     변경 이유 : pagedir 가 NULL 이 아니면 Spt 가 초기화되어 있다는 관계를 지켜
+                 process_exit () 이 pd != NULL 블록에서만 Spt 를 해제하게 한다,
+                 hash_init () 실패 상태의 hash 를 hash_destroy () 하면 NULL buckets 를 순회한다
+     영향 범위 : load () 의 pagedir 생성 직후, VM 빌드만 */
+#ifdef VM
+  if (!page_table_init (&t->Spt))
+    {
+      pagedir_destroy (t->pagedir);
+      t->pagedir = NULL;
+      goto done;
+    }
+#endif
   process_activate ();
 
   /* Open executable file. */
@@ -730,6 +777,13 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
   ASSERT (ofs % PGSIZE == 0);
 
   file_seek (file, ofs);
+  /* [3-1-2] Supplemental Page Table : load_segment 의 파일 위치 추적
+     변경 내용 : 페이지마다 항목에 기록할 파일 위치 page_ofs 를 ofs 에서 시작해 둔다
+     변경 이유 : 항목에 페이지가 시작하는 파일 위치를 남기기 위해 (매뉴얼 4.1.4)
+     영향 범위 : load_segment () 의 지역 변수, VM 빌드만 */
+#ifdef VM
+  off_t page_ofs = ofs;
+#endif
   while (read_bytes > 0 || zero_bytes > 0) 
     {
       /* Calculate how to fill this page.
@@ -738,6 +792,22 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
       size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
       size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
+      /* [3-1-2] Supplemental Page Table : load_segment 의 항목 기록
+         변경 내용 : frame 을 얻기 전에 page_add_file () 로 페이지 항목을 Spt 에 기록한다
+         변경 이유 : 항목 기록을 frame 할당보다 먼저 해서 기록 실패 시 해제할 frame 이 없게 한다
+         영향 범위 : load_segment () 의 루프 안, VM 빌드만 */
+#ifdef VM
+      struct page *p = page_add_file (upage, file, page_ofs, page_read_bytes,
+                                      page_zero_bytes, writable);
+      if (p == NULL)
+        return false;
+#endif
+
+      /* [3-1-3] 지연 로딩 : load_segment 의 적재 구간
+         변경 내용 : VM 빌드에서는 frame 할당 · 파일 읽기 · 매핑을 하지 않고 [3-1-2] 의 항목 기록만 남긴다
+         변경 이유 : 지연 로딩 (Pintos manual 4.3.2), 실제 적재는 page_fault () 의 handle_mm_fault () 가 맡는다 (조교 슬라이드 11 · 12)
+         영향 범위 : load_segment () 루프, VM 빌드만. [3-1-1] 의 frame 분기와 [3-1-2] 의 kpage 기록은 이 구간이 VM 빌드에서 빠지므로 지웠다 */
+#ifndef VM
       /* Get a page of memory. */
       uint8_t *kpage = palloc_get_page (PAL_USER);
       if (kpage == NULL)
@@ -757,11 +827,19 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
           palloc_free_page (kpage);
           return false; 
         }
+#endif
 
       /* Advance. */
       read_bytes -= page_read_bytes;
       zero_bytes -= page_zero_bytes;
       upage += PGSIZE;
+      /* [3-1-2] Supplemental Page Table : load_segment 의 파일 위치 전진
+         변경 내용 : 다음 페이지의 파일 위치로 page_ofs 를 page_read_bytes 만큼 옮긴다
+         변경 이유 : 항목에 페이지가 시작하는 파일 위치를 남기기 위해 (매뉴얼 4.1.4)
+         영향 범위 : load_segment () 의 루프 끝, VM 빌드만 */
+#ifdef VM
+      page_ofs += page_read_bytes;
+#endif
     }
   return true;
 }
@@ -774,15 +852,52 @@ setup_stack (void **esp)
   uint8_t *kpage;
   bool success = false;
 
+  /* [3-1-2] Supplemental Page Table : setup_stack 의 항목 기록
+     변경 내용 : frame 을 얻기 전에 page_add_anon () 으로 스택 페이지 항목을 Spt 에 기록한다
+     변경 이유 : 항목 기록을 frame 할당보다 먼저 해서 기록 실패 시 해제할 frame 이 없게 한다
+     영향 범위 : setup_stack () 의 첫머리, VM 빌드만 */
+#ifdef VM
+  struct page *p = page_add_anon (((uint8_t *) PHYS_BASE) - PGSIZE, true);
+  if (p == NULL)
+    return false;
+#endif
+
+  /* [3-1-1] Frame Table : setup_stack 의 frame 할당
+     변경 내용 : palloc_get_page (PAL_USER | PAL_ZERO) 대신
+                 frame_alloc (PAL_USER | PAL_ZERO, 스택 페이지) 를 쓴다
+     변경 이유 : 사용자 frame 을 frame table 로 관리하기 위해 (매뉴얼 4.2 1단계)
+                 userprog 빌드는 vm/ 의 .c 파일을 컴파일하지 않으므로 #else 에 원본 유지
+     영향 범위 : setup_stack () 의 페이지 할당 */
+#ifdef VM
+  kpage = frame_alloc (PAL_USER | PAL_ZERO, ((uint8_t *) PHYS_BASE) - PGSIZE);
+#else
   kpage = palloc_get_page (PAL_USER | PAL_ZERO);
+#endif
   if (kpage != NULL) 
     {
       success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
       if (success)
         *esp = PHYS_BASE;
       else
+        /* [3-1-1] Frame Table : install_page 실패 시 frame 해제
+           변경 내용 : palloc_free_page (kpage) 대신 frame_free (kpage) 를 쓴다
+           변경 이유 : 사용자 frame 을 frame table 로 관리하기 위해 (매뉴얼 4.2 1단계)
+                       userprog 빌드는 vm/ 의 .c 파일을 컴파일하지 않으므로 #else 에 원본 유지
+           영향 범위 : setup_stack () 의 install_page 실패 경로 */
+#ifdef VM
+        frame_free (kpage);
+#else
         palloc_free_page (kpage);
+#endif
     }
+  /* [3-1-2] Supplemental Page Table : setup_stack 의 kpage 기록
+     변경 내용 : 성공하면 스택 항목의 kpage 에 frame 주소를 남긴다
+     변경 이유 : 항목이 실린 frame 을 가리키게 하기 위해 (매뉴얼 4.1.4)
+     영향 범위 : setup_stack () 의 반환 직전, VM 빌드만 */
+#ifdef VM
+  if (success)
+    p->kpage = kpage;
+#endif
   return success;
 }
 

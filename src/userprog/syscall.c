@@ -30,6 +30,14 @@
    참고 : userprog/process.h */
 #include "userprog/process.h"
 
+/* [3-1-3] 지연 로딩 : check_address 에 필요한 헤더 추가
+   변경 내용 : VM 빌드에서 page_find () 와 handle_mm_fault () 를 위해 vm/page.h 를 include 한다
+   변경 이유 : 지연 로딩에서 check_address () 가 SPT 기준으로 검사하고 미리 적재하기 위해
+   영향 범위 : syscall.c 의 include 만, VM 빌드만 */
+#ifdef VM
+#include "vm/page.h"
+#endif
+
 /* [1-2-2] create, remove 구현에 필요한 헤더 추가
    목적 : filesys_create() 와 filesys_remove() 를 호출한다
    참고 : proj1 슬라이드 71 - filesys/filesys.h 의 API 를 사용하라는 안내
@@ -129,9 +137,55 @@ check_address (const void *addr, unsigned size)
 
   /* 접근 범위가 걸쳐 있는 모든 페이지가 현재 프로세스에 매핑되어 있는지 확인 */
   for (page = pg_round_down (begin); page <= end; page += PGSIZE)
+    /* [3-1-3] 지연 로딩 : check_address 의 SPT 기준 검사와 미리 적재
+       변경 내용 : VM 빌드에서는 SPT 에 항목이 없으면 exit (-1), 있는데 아직 안 올라왔으면
+                   handle_mm_fault () 로 미리 적재하고 실패하면 exit (-1) 한다
+       변경 이유 : 지연 로딩에서는 정상 페이지도 아직 매핑되지 않았을 수 있다,
+                   Filesys_lock 을 잡기 전에 미리 적재해 lock 을 잡은 채 page fault 가 나지 않게 한다 (매뉴얼 4.3.5)
+       영향 범위 : check_address () 의 for 문 본문, VM 빌드만 */
+#ifdef VM
+    {
+      struct page *p = page_find (&t->Spt, page);
+      if (p == NULL)
+        exit (-1);
+      if (p->kpage == NULL && !handle_mm_fault (p))
+        exit (-1);
+    }
+#else
     if (pagedir_get_page (t->pagedir, page) == NULL)
       exit (-1);
+#endif
 }
+
+/* [3-1-4] 쓰기 권한 검사 : 사용자 버퍼가 쓰기 가능한 페이지인지 확인
+   목적 : 커널이 사용자 버퍼에 쓰기 전에 버퍼가 걸친 모든 페이지가 SPT 에서 writable 인지 검사한다
+   입력 : addr - 버퍼 시작 주소
+          size - 버퍼 크기
+   출력 : 모두 쓰기 가능하면 그냥 반환하고, 아니면 exit (-1) 로 반환하지 않는다
+   참고 : Pintos manual 3.1.5, 4.3.5, 조교 슬라이드 9 (write to a read-only page 는 invalid access)
+   주의 : Filesys_lock 을 잡기 전에 부른다, 커널이 읽기 전용 사용자 페이지에 쓰면 커널 문맥 fault 가 나 프로세스를 안전하게 끝낼 수 없으므로 쓰기 전에 검사한다
+          check_address () 가 범위 · NULL · 커널 주소 · SPT 존재를 검사하고 미리 적재하므로 여기서는 writable 만 본다 */
+#ifdef VM
+static void
+check_writable (const void *addr, unsigned size)
+{
+  struct thread *t = thread_current ();
+  const uint8_t *end;
+  const uint8_t *page;
+
+  check_address (addr, size);
+  if (size == 0)
+    return;
+
+  end = (const uint8_t *) addr + size - 1;
+  for (page = pg_round_down (addr); page <= end; page += PGSIZE)
+    {
+      struct page *p = page_find (&t->Spt, page);
+      if (p == NULL || !p->writable)
+        exit (-1);
+    }
+}
+#endif
 
 /* [1-1-4] System Call Handler : 사용자 스택에서 인자 꺼내기
    목적 : 시스템 콜 번호 바로 위 칸부터 count 개의 4바이트 인자를
@@ -275,7 +329,15 @@ read (int fd, void *buffer, unsigned size)
   struct file *File;
   int bytes;
 
+  /* [3-1-4] 쓰기 권한 검사 : read 의 버퍼 검사
+     변경 내용 : VM 빌드에서 버퍼 검사를 check_writable () 로 바꾼다
+     변경 이유 : read 는 사용자 버퍼에 쓰는 유일한 시스템 콜이다, 코드 영역 같은 읽기 전용 페이지를 넘기면 exit (-1) 해야 한다 (pt-write-code2)
+     영향 범위 : read () 의 버퍼 검사, VM 빌드만, 쓰기 가능한 버퍼에는 변화 없음 */
+#ifdef VM
+  check_writable (buffer, size);
+#else
   check_address (buffer, size);
+#endif
 
   if (fd == STDIN_FILENO)
     {

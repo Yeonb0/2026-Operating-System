@@ -17,6 +17,13 @@
    주의 : vaddr.h 가 포함하는 것은 debug.h, stdint.h, stdbool.h, loader.h 뿐이라
           thread.h 를 되부르지 않는다, 즉 순환 참조가 생기지 않는다 */
 #include "threads/vaddr.h"
+/* [3-1-2] Supplemental Page Table : hash.h 포함
+   변경 내용 : VM 빌드에서 struct thread 의 Spt 필드를 위해 hash.h 를 include 한다
+   변경 이유 : 프로세스별 보조 페이지 테이블을 hash 로 관리하기 위해 (매뉴얼 4.1.4)
+   영향 범위 : VM 빌드의 thread.h 만, 다른 빌드는 변화 없음 */
+#ifdef VM
+#include <hash.h>
+#endif
 
 /* [2-2-4] Priority Aging : aging 사용 여부 플래그 선언
    목적 : 커널 옵션 -aging 이 주어졌는지 다른 파일에서 확인할 수 있게 한다
@@ -210,6 +217,16 @@ struct thread
               얻은 fd 로 써도 0 바이트만 기록된다
               적재에 실패한 경우 load () 안에서 닫고 이 필드는 NULL 로 남긴다 */
     struct file *Exec_file;             /* Executable file, write denied */
+
+    /* [3-1-2] Supplemental Page Table : 프로세스별 SPT 필드
+       변경 내용 : VM 빌드에서 struct thread 에 hash Spt 를 추가한다
+       변경 이유 : 페이지마다 출처와 속성을 기록하는 보조 페이지 테이블을
+                   프로세스별로 두기 위해 (매뉴얼 4.1.4)
+       영향 범위 : VM 빌드의 struct thread 크기, 다른 빌드는 변화 없음
+       주의 : pagedir 가 NULL 이 아니면 Spt 가 초기화되어 있다 */
+#ifdef VM
+    struct hash Spt;                    /* Supplemental page table */
+#endif
 #endif
 
     /* Owned by thread.c. */

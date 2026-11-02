@@ -31,6 +31,14 @@
 #else
 #include "tests/threads/tests.h"
 #endif
+/* [3-1-1] Frame Table : vm/frame.h 포함
+   변경 내용 : VM 빌드에서 vm/frame.h 를 include 한다
+   변경 이유 : 사용자 frame 을 frame table 로 관리하기 위해 (매뉴얼 4.2 1단계)
+               userprog 빌드는 vm/ 의 .c 파일을 컴파일하지 않으므로 #ifdef VM 으로 감싼다
+   영향 범위 : VM 빌드의 init.c 만, 다른 빌드는 변화 없음 */
+#ifdef VM
+#include "vm/frame.h"
+#endif
 #ifdef FILESYS
 #include "devices/block.h"
 #include "devices/ide.h"
@@ -98,6 +106,14 @@ main (void)
   palloc_init (user_page_limit);
   malloc_init ();
   paging_init ();
+  /* [3-1-1] Frame Table : frame table 초기화
+     변경 내용 : paging_init () 직후 frame_init () 을 부른다
+     변경 이유 : 사용자 frame 을 frame table 로 관리하기 위해 (매뉴얼 4.2 1단계)
+                 userprog 빌드는 vm/ 의 .c 파일을 컴파일하지 않으므로 #ifdef VM 으로 감싼다
+     영향 범위 : VM 빌드의 부팅 순서만, 다른 빌드는 변화 없음 */
+#ifdef VM
+  frame_init ();
+#endif
 
   /* Segmentation. */
 #ifdef USERPROG

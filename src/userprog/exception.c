@@ -4,6 +4,15 @@
 #include "userprog/gdt.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
+/* [3-1-3] 지연 로딩 : page_fault 에 필요한 헤더 추가
+   변경 내용 : is_user_vaddr () 를 위해 threads/vaddr.h 를, VM 빌드에서는 page_find () 와
+               handle_mm_fault () 를 위해 vm/page.h 를 include 한다
+   변경 이유 : 지연 로딩에서 page_fault () 가 SPT 를 찾아 페이지를 적재하기 위해 (조교 슬라이드 11 · 12)
+   영향 범위 : exception.c 의 include 만, vm/page.h 는 VM 빌드만 */
+#include "threads/vaddr.h"
+#ifdef VM
+#include "vm/page.h"
+#endif
 
 /* Number of page faults processed. */
 static long long page_fault_cnt;
@@ -147,6 +156,26 @@ page_fault (struct intr_frame *f)
   not_present = (f->error_code & PF_P) == 0;
   write = (f->error_code & PF_W) != 0;
   user = (f->error_code & PF_U) != 0;
+
+  /* [3-1-3] 지연 로딩 : page_fault 의 SPT 조회와 적재
+     변경 내용 : not-present fault 가 사용자 주소에서 났으면 SPT 에서 항목을 찾아
+                 handle_mm_fault () 로 적재하고, 성공하면 fault 난 명령을 다시 실행하도록 반환한다
+     변경 이유 : SPT 에 항목이 있고 아직 메모리에 없으며 쓰기라면 쓰기 가능한 페이지일 때만
+                 올바른 참조로 본다 (조교 슬라이드 9 · 11, 매뉴얼 4.1.4)
+                 스택 확장 판정은 3-3 에서 이 자리에 추가한다
+                 그 밖의 접근은 원래대로 kill (f) 로 간다 (조교 슬라이드 11 의 Kill process)
+     영향 범위 : page_fault () 의 앞부분, VM 빌드만
+     주의 : pagedir 가 NULL 이 아닌 프로세스에서만 Spt 를 조회한다 (3-1-2 의 관계) */
+#ifdef VM
+  if (not_present && is_user_vaddr (fault_addr)
+      && thread_current ()->pagedir != NULL)
+    {
+      struct page *p = page_find (&thread_current ()->Spt, fault_addr);
+      if (p != NULL && p->kpage == NULL && (!write || p->writable)
+          && handle_mm_fault (p))
+        return;
+    }
+#endif
 
   /* To implement virtual memory, delete the rest of the function
      body, and replace it with code that brings in the page to
